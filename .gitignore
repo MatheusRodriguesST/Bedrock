@@ -1,0 +1,8 @@
+# Rust build artifacts
+/target
+
+# Notas de estudo pessoais (Obsidian) — não versionar
+/notas
+
+# Arquivo de banco gerado nos testes manuais
+*.db
