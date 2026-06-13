@@ -1,0 +1,53 @@
+name: CI
+
+# Quando rodar: a cada push e a cada pull request.
+on:
+  push:
+  pull_request:
+
+# Cancela execuções antigas do mesmo branch se um push novo chegar
+# (evita fila de builds redundantes e economiza minutos de CI).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ci:
+    name: build, test, lint, fmt
+    runs-on: ubuntu-latest
+    steps:
+      # 1. Baixa o seu código para dentro da VM.
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 2. Instala a toolchain Rust estável + os componentes de lint/fmt.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      # 3. Cache de dependências: sem isso, todo build baixa e recompila
+      #    o mundo. Com isso, builds seguindo o primeiro ficam minutos mais rápidos.
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # 4. Formatação: falha se algum arquivo não estiver no padrão do rustfmt.
+      #    --check não altera nada, só reporta. (Local: `cargo fmt` arruma.)
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      # 5. Lint: clippy pega armadilhas e código não-idiomático.
+      #    -D warnings transforma todo warning em erro -> o job falha.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # 6. Build de todo o workspace.
+      - name: Build
+        run: cargo build --workspace --verbose
+
+      # 7. Testes de todo o workspace.
+      - name: Test
+        run: cargo test --workspace --verbose
