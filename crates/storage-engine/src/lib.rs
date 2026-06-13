@@ -1,11 +1,28 @@
 use std::collections::HashMap;
 use std::fs;
 use std::fs::OpenOptions;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufReader, Read, Write};
 
 pub struct Db {
     index: HashMap<String, String>,
     file: fs::File,
+}
+
+/// Serializa um registro no formato binário do log (ver doc do módulo).
+/// `op`: `0` = SET, `1` = DEL. Para um DEL, passe `val = &[]`.
+fn encode_record(op: u8, key: &[u8], val: &[u8]) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.push(op);
+    body.extend_from_slice(&(key.len() as u32).to_le_bytes());
+    body.extend_from_slice(&(val.len() as u32).to_le_bytes());
+    body.extend_from_slice(key);
+    body.extend_from_slice(val);
+
+    let checksum = crc32fast::hash(&body);
+    let mut record = Vec::new();
+    record.extend_from_slice(&checksum.to_le_bytes());
+    record.extend_from_slice(&body);
+    record
 }
 
 impl Db {
@@ -15,29 +32,61 @@ impl Db {
             .read(true)
             .append(true)
             .open(path)?;
-        let mut index = HashMap::new();
-        for line in BufReader::new(&file).lines() {
-            let line = line?;
-            let mut parts = line.splitn(3, '\t');
 
-            match (parts.next(), parts.next(), parts.next()) {
-                (Some("SET"), Some(key), Some(value)) => {
-                    index.insert(key.to_string(), value.to_string());
-                }
-                (Some("DEL"), Some(key), None) => {
-                    index.remove(key);
-                }
-                _ => {}
+        let mut index = HashMap::new();
+        let mut reader = BufReader::new(&file);
+
+        loop {
+            //checksum
+            let mut cksum_bytes = [0u8; 4];
+            match reader.read_exact(&mut cksum_bytes) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e),
+            }
+            let checksum_lido = u32::from_le_bytes(cksum_bytes);
+
+            //header: op(1) + key_len(4) + val_len(4) = 9 bytes.
+            let mut header = [0u8; 9];
+            if reader.read_exact(&mut header).is_err() {
+                break;
+            }
+            let op = header[0];
+            let key_len = u32::from_le_bytes(header[1..5].try_into().unwrap()) as usize;
+            let val_len = u32::from_le_bytes(header[5..9].try_into().unwrap()) as usize;
+
+            //payload: key + val, know size know
+            let total = key_len + val_len;
+            let mut payload = vec![0u8; total];
+            if reader.read_exact(&mut payload).is_err() {
+                break;
+            }
+
+            let mut body = Vec::new();
+            body.extend_from_slice(&header);
+            body.extend_from_slice(&payload);
+            if crc32fast::hash(&body) != checksum_lido {
+                break;
+            }
+
+            //cut payload
+            let key = String::from_utf8(payload[..key_len].to_vec()).unwrap();
+            if op == 0 {
+                let val = String::from_utf8(payload[key_len..].to_vec()).unwrap();
+                index.insert(key, val);
+            } else if op == 1 {
+                index.remove(&key);
             }
         }
+
         Ok(Db { index, file })
     }
 
     pub fn set(&mut self, key: String, value: String) -> io::Result<()> {
-        let log = format!("SET\t{}\t{}\n", key, value);
+        let rec = encode_record(0, key.as_bytes(), value.as_bytes());
 
-        self.file.write_all(log.as_bytes())?;
-        self.file.flush()?;
+        self.file.write_all(&rec)?;
+        self.file.sync_all()?;
         self.index.insert(key, value);
         Ok(())
     }
@@ -47,10 +96,10 @@ impl Db {
     }
 
     pub fn delete(&mut self, key: &str) -> io::Result<()> {
-        let log = format!("DEL\t{}\n", key);
+        let rec = encode_record(1, key.as_bytes(), &[]);
 
-        self.file.write_all(log.as_bytes())?;
-        self.file.flush()?;
+        self.file.write_all(&rec)?;
+        self.file.sync_all()?;
         self.index.remove(key);
         Ok(())
     }
