@@ -54,14 +54,16 @@ ou MVCC para isolamento de transações.
 ---
 
 ## Onde paramos (atualizar a cada sessão)
-- ✅ FEITO: `open` com replay, `set`, `get`, **`delete` via tombstone** (replay entende `DEL`).
-  Durabilidade a **restart limpo** confirmada — inclusive para deleções (teste de fogo
-  `delete_survives_reopen` passou).
-- ✅ FEITO: crate separado em **`lib.rs` (API `Db` com métodos `pub`, campos privados) +
-  `main.rs` (demo fina)**; testes automatizados na lib; **CI** (`fmt`+`clippy -D warnings`+
-  `build`+`test`) a cada push/PR.
-- ⏭️ PRÓXIMO (degrau 5): fsync (`sync_all`) + checksum por registro → durabilidade a **crash**
-  (WAL real); replay tolera registro rasgado (torn write).
+- ✅ FEITO: `open`/`set`/`get`/`delete` no **formato binário tamanho-prefixado**
+  (`[checksum u32][op u8][key_len u32][val_len u32][key][val]`, little-endian), com **fsync
+  por escrita** (`sync_all`) + **CRC32 por registro** (crate `crc32fast`) + replay
+  **tolerante a torn write** (para na cauda rasgada via CRC/leitura curta).
+- ✅ FEITO: **teste de crash com SIGKILL** (`tests/crash_recovery.rs` + binário auxiliar
+  `crash_writer`) — entregável #2. Verifica que nada confirmado se perde e o replay
+  sobrevive. Crate em **`lib.rs` (API `Db`) + `main.rs`**; CI a cada push/PR.
+- ⏭️ PRÓXIMO (degrau 6): índice de offsets (chave→posição no arquivo, não o valor) →
+  Bitcask completo. Em paralelo, faltam benchmarks (#1) e README em inglês (#3).
+- 🧭 GARANTIA ATUAL: durabilidade a **crash** (assumindo que o disco honra o fsync).
 
 ## Roadmap em degraus (cada um resolve a limitação do anterior)
 1. **[FEITO]** `struct Db` + `open` (abre/cria o log, índice em memória)
