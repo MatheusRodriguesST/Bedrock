@@ -7,17 +7,18 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 use storage_engine::Db;
 
-fn temp_path(name: &str) -> std::path::PathBuf {
+fn temp_dir(name: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
-    p.push(format!("bedrock-crash-{}-{}.db", std::process::id(), name));
-    let _ = std::fs::remove_file(&p);
+    p.push(format!("bedrock-crash-{}-{}", std::process::id(), name));
+    let _ = std::fs::remove_dir_all(&p);
     p
 }
 
 #[test]
 fn survives_sigkill_mid_write() {
-    let path = temp_path("sigkill");
+    let path = temp_dir("sigkill");
     let p = path.to_str().unwrap().to_string();
+    let seg = path.join("000001.seg"); // the active segment the writer fills
 
     // Spawn the writer (separate binary) that appends records, fsyncing each.
     // CARGO_BIN_EXE_crash_writer is the binary's path, injected by Cargo for tests.
@@ -30,7 +31,7 @@ fn survives_sigkill_mid_write() {
     // child.kill() sends SIGKILL on Unix.
     let start = Instant::now();
     loop {
-        if let Ok(meta) = std::fs::metadata(&path) {
+        if let Ok(meta) = std::fs::metadata(&seg) {
             if meta.len() > 200 {
                 break;
             }
@@ -73,5 +74,5 @@ fn survives_sigkill_mid_write() {
         "index has a gap: key-{n} missing but a later key is present"
     );
 
-    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&path);
 }
