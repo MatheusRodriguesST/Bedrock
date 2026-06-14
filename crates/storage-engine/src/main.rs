@@ -1,8 +1,8 @@
 use storage_engine::Db;
 
 fn main() {
-    let mut db = Db::open("database.db").expect("falhou ao abrir o banco");
-    db.set("nome".to_string(), "matheus".to_string())
-        .expect("Falha ao salvar");
-    println!("{:?}", db.get("nome"));
+    let mut db = Db::open("database.db").expect("failed to open database");
+    db.set("name".to_string(), "matheus".to_string())
+        .expect("failed to write");
+    println!("{:?}", db.get("name"));
 }

@@ -6,3 +6,6 @@
 
 # Arquivo de banco gerado nos testes manuais
 *.db
+
+# Ferramentas pessoais locais (não versionar por enquanto)
+/playground/

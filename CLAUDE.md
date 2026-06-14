@@ -58,22 +58,25 @@ ou MVCC para isolamento de transações.
   (`[checksum u32][op u8][key_len u32][val_len u32][key][val]`, little-endian), com **fsync
   por escrita** (`sync_all`) + **CRC32 por registro** (crate `crc32fast`) + replay
   **tolerante a torn write** (para na cauda rasgada via CRC/leitura curta).
-- ✅ FEITO: **teste de crash com SIGKILL** (`tests/crash_recovery.rs` + binário auxiliar
-  `crash_writer`) — entregável #2. Verifica que nada confirmado se perde e o replay
-  sobrevive. Crate em **`lib.rs` (API `Db`) + `main.rs`**; CI a cada push/PR.
-- ⏭️ PRÓXIMO (degrau 6): índice de offsets (chave→posição no arquivo, não o valor) →
-  Bitcask completo. Em paralelo, faltam benchmarks (#1) e README em inglês (#3).
+- ✅ FEITO: **teste de crash com SIGKILL** (`tests/crash_recovery.rs` + `crash_writer`) — #2.
+- ✅ FEITO (degrau 6): **índice de offsets** — índice guarda `ValueLoc { offset, len }`,
+  valor fica no disco (`get` faz seek+read). Dataset pode passar da RAM. Bitcask completo.
+- ✅ FEITO: **benchmarks** (criterion, `cargo bench`) e **README profissional em inglês** (#1, #3).
+  Código todo em **inglês**, docs no código enxutos (formato detalhado no README).
+- ⏭️ PRÓXIMO (degrau 7): segmentos + compaction (recuperar espaço dos registros mortos;
+  base do LSM-tree).
 - 🧭 GARANTIA ATUAL: durabilidade a **crash** (assumindo que o disco honra o fsync).
+  Números: `set` ~2,7 ms (fsync real `F_FULLFSYNC`), `get` ~740 ns, `open` 10k ~1,5 ms.
 
 ## Roadmap em degraus (cada um resolve a limitação do anterior)
 1. **[FEITO]** `struct Db` + `open` (abre/cria o log, índice em memória)
 2. **[FEITO]** `set` / `get` — escrever no log e ler do índice
 3. **[FEITO]** replay do log no `open` (reconstruir o índice no boot) → durabilidade a restart
 4. **[FEITO]** `delete` via tombstone (+ replay entende `DEL`); crate virou lib (`Db`) + bin
-5. **[PRÓXIMO]** `fsync` (`sync_all`) + checksum por registro → durabilidade a **crash** (vira WAL de verdade);
+5. **[FEITO]** `fsync` (`sync_all`) + checksum por registro → durabilidade a **crash** (WAL de verdade);
    replay tolera registro rasgado (torn write)
-6. Índice de offsets (guarda chave→posição, não o valor) → estilo Bitcask completo
-7. Segmentos + compaction → base do LSM-tree
+6. **[FEITO]** Índice de offsets (guarda chave→posição, não o valor) → estilo Bitcask completo
+7. **[PRÓXIMO]** Segmentos + compaction → base do LSM-tree
 8. Concorrência: lock (`RwLock`) → depois MVCC (sequence numbers, snapshot isolation)
 9. API HTTP / linguagem de query mínima
 
