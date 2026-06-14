@@ -61,12 +61,16 @@ ou MVCC para isolamento de transações.
 - ✅ FEITO: **teste de crash com SIGKILL** (`tests/crash_recovery.rs` + `crash_writer`) — #2.
 - ✅ FEITO (degrau 6): **índice de offsets** — índice guarda `ValueLoc { offset, len }`,
   valor fica no disco (`get` faz seek+read). Dataset pode passar da RAM. Bitcask completo.
-- ✅ FEITO: **benchmarks** (criterion, `cargo bench`) e **README profissional em inglês** (#1, #3).
-  Código todo em **inglês**, docs no código enxutos (formato detalhado no README).
-- ⏭️ PRÓXIMO (degrau 7): segmentos + compaction (recuperar espaço dos registros mortos;
-  base do LSM-tree).
+- ✅ FEITO: **benchmarks** (criterion, `cargo bench`) com **baseline SQLite** (durabilidade
+  igualada) e **README profissional em inglês** (#1, #3). Código todo em **inglês**.
+- ✅ FEITO (degrau 7): **segmentos + compaction**. Manifesto (`manifest`) = fonte da verdade
+  dos segmentos vivos; compaction síncrona por tamanho mescla imutáveis, swap **atômico** do
+  manifesto (crash-safe), órfãos limpos no `open`. + truncate-on-recovery. `debug_status`
+  (introspecção read-only) pro observer em `playground/observer`.
+- ⏭️ PRÓXIMO (degrau 8): concorrência — `RwLock` para leituras concorrentes, depois **MVCC**
+  (sequence numbers + snapshot isolation). Ver [[07-concorrencia-mvcc]] nas notas.
 - 🧭 GARANTIA ATUAL: durabilidade a **crash** (assumindo que o disco honra o fsync).
-  Números: `set` ~2,7 ms (fsync real `F_FULLFSYNC`), `get` ~740 ns, `open` 10k ~1,5 ms.
+  Números: `set` ~2,6 ms (vs SQLite ~2,8 ms), `get` ~0,77 µs (vs SQLite ~2,15 µs).
 
 ## Roadmap em degraus (cada um resolve a limitação do anterior)
 1. **[FEITO]** `struct Db` + `open` (abre/cria o log, índice em memória)
@@ -76,8 +80,8 @@ ou MVCC para isolamento de transações.
 5. **[FEITO]** `fsync` (`sync_all`) + checksum por registro → durabilidade a **crash** (WAL de verdade);
    replay tolera registro rasgado (torn write)
 6. **[FEITO]** Índice de offsets (guarda chave→posição, não o valor) → estilo Bitcask completo
-7. **[PRÓXIMO]** Segmentos + compaction → base do LSM-tree
-8. Concorrência: lock (`RwLock`) → depois MVCC (sequence numbers, snapshot isolation)
+7. **[FEITO]** Segmentos + compaction (manifesto crash-safe) → base do LSM-tree
+8. **[PRÓXIMO]** Concorrência: lock (`RwLock`) → depois MVCC (sequence numbers, snapshot isolation)
 9. API HTTP / linguagem de query mínima
 
 ## Garantias a documentar no README final

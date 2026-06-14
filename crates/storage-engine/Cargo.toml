@@ -8,7 +8,13 @@ crc32fast = "1"
 
 [dev-dependencies]
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+# dev-only: SQLite baseline for the comparison benchmark (bundled, no system dep).
+rusqlite = { version = "0.31", features = ["bundled"] }
 
 [[bench]]
 name = "engine"
+harness = false
+
+[[bench]]
+name = "compare"
 harness = false

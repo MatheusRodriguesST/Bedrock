@@ -10,6 +10,14 @@ It is a learning-by-building project focused on database internals: on-disk stor
 durability, crash recovery, and indexing. Design decisions and their trade-offs are
 documented below — that is the point of the project as much as the code.
 
+**Highlights**
+
+- Custom binary, length-prefixed on-disk format with a per-record **CRC32**.
+- **`fsync` on every write** (`F_FULLFSYNC` on macOS) → crash durability, proven by a SIGKILL test.
+- In-memory **offset index** (Bitcask-style): values stay on disk, so the dataset can exceed RAM.
+- Log-structured **segments + crash-safe compaction** (atomic manifest swap).
+- **Benchmarked vs SQLite** under matched durability; CI runs fmt + clippy + tests on every push.
+
 ## Status & guarantees
 
 | Property | Guarantee |
@@ -24,14 +32,28 @@ documented below — that is the point of the project as much as the code.
 Bedrock is a **Bitcask-style** engine (see *Designing Data-Intensive Applications*,
 ch. 3, "Hash Indexes"):
 
-- **Append-only log.** Every `set`/`delete` appends one record to the end of a single
-  data file. Nothing is ever updated in place.
+- **Append-only log.** Every `set`/`delete` appends one record to the active segment.
+  Nothing is ever updated in place.
 - **In-memory index.** A hash map maps each key to the **on-disk location** of its
   value (`offset + length`) — not the value itself. RAM usage scales with the *number
   of keys*, not the total size of the values, so the dataset can exceed RAM. Reads do
   one `seek + read`; the OS page cache absorbs the cost of hot keys.
-- **Recovery by replay.** On `open`, the log is replayed front to back to rebuild the
-  index. A `DEL` tombstone removes the key, so deletes survive restarts.
+- **Segments + compaction.** The log is split into fixed-size segment files; the active
+  one rolls over when it fills. A size-triggered **compaction** merges the immutable
+  segments into one, keeping only the latest value per key, which reclaims the space held
+  by overwritten and deleted records.
+- **Recovery by replay.** On `open`, the live segments are replayed in order to rebuild
+  the index. A `DEL` tombstone removes the key, so deletes survive restarts.
+
+### Manifest (crash-safe compaction)
+
+A `manifest` file lists the live segments in replay order and is the source of truth for
+which segments are valid. Compaction writes a new segment, fsyncs it, then **atomically
+swaps the manifest** (write-temp + `rename`) before deleting the old segments. A crash
+before the swap leaves the old set live (the new segment is an ignored orphan); a crash
+after leaves the new set live (the old segments are orphans, cleaned up on the next open).
+The swap is the single atomic step that makes compaction safe — the same idea LevelDB and
+RocksDB use.
 
 ### On-disk record format
 
@@ -57,26 +79,41 @@ values are safe and a half-written record at the tail is unambiguous.
 
 Measured with [Criterion](https://github.com/bheisler/criterion.rs) on a development
 laptop (macOS); reproduce with `cargo bench`. Absolute numbers are hardware-dependent —
-the **ratios** are the point.
+the ratios and the comparison below are the point.
 
 | Operation | Latency | Throughput |
 |-----------|---------|------------|
-| `set` (append + fsync) | ~2.7 ms | ~370 ops/s |
-| `get` (index + seek + read, warm cache) | ~740 ns | ~1.35M ops/s |
+| `set` (append + fsync) | ~2.6 ms | ~385 ops/s |
+| `get` (index + seek + read, warm cache) | ~770 ns | ~1.3M ops/s |
 | `open` (replay 10k records) | ~1.5 ms | ~150 ns/record |
 
-**Reads are ~3,600× faster than writes** — because each write pays a real durability
-barrier. On macOS, Rust's `File::sync_all` issues `F_FULLFSYNC`, which forces data all
-the way to the physical medium rather than just to the drive's write cache. That ~2.7 ms
-is the honest cost of *true* crash durability, not a weaker `fsync`. It also motivates a
-future **group-commit** optimization (batch many writes behind one flush) to trade
-latency for throughput.
+Reads pay no durability barrier; writes do — which is why writes are ~3,000× slower. On
+macOS, `File::sync_all` issues `F_FULLFSYNC`, forcing data to the physical medium (not just
+the drive cache), so that ~2.6 ms is the honest cost of *true* crash durability. It also
+motivates a future **group-commit** optimization (batch writes behind one flush).
+
+### vs SQLite (matched durability)
+
+Same workload against SQLite in WAL mode with `synchronous=FULL` + `fullfsync=ON`, so both
+engines fsync every write to survive a machine crash. They are different designs — Bedrock
+is an append-only KV log, SQLite a B-tree SQL engine — so this is positioning, not a contest
+(`cargo bench --bench compare`):
+
+| Operation | Bedrock | SQLite |
+|-----------|---------|--------|
+| write (fsync per write) | ~2.6 ms | ~2.8 ms |
+| read (point lookup) | ~0.77 µs | ~2.15 µs |
+
+Writes land in the same ballpark: both are dominated by the fsync barrier, so the cost is
+durability, not the engine. On point reads Bedrock is ~3× faster — a hash-index lookup plus
+one `seek`+`read` beats SQL parsing and a B-tree descent, which is the upside of a
+specialized key/value store over a general SQL engine.
 
 ## Design decisions & trade-offs
 
 - **Append-only log, not in-place B-Tree.** Appends are sequential writes (fast, simple
   to make crash-safe) at the cost of space: superseded and deleted records linger until
-  **compaction** (roadmap). A B-Tree updates in place — less space amplification, but
+  **compaction** reclaims them. A B-Tree updates in place — less space amplification, but
   in-place writes are harder to make atomic and durable.
 - **Index stores offsets, not values.** Enables datasets larger than RAM, at the cost of
   one disk read per `get` (read amplification), softened by the page cache.
@@ -88,8 +125,7 @@ latency for throughput.
 
 ### What it does **not** do (yet)
 
-Multi-key transactions, concurrent writers, compaction/segment merging, and a network
-API. See the roadmap.
+Multi-key transactions, concurrent writers, and a network API. See the roadmap.
 
 ## Roadmap
 
@@ -98,7 +134,7 @@ API. See the roadmap.
 - [x] `delete` via tombstones
 - [x] Binary length-prefixed format, per-record CRC32, `fsync` → crash durability
 - [x] Offset index (values on disk, not in RAM) — Bitcask-complete
-- [ ] Segments + compaction (reclaim space; foundation for an LSM-tree)
+- [x] Segments + size-triggered, crash-safe compaction (manifest swap)
 - [ ] Concurrency: `RwLock`, then MVCC / snapshot isolation
 - [ ] Network API (HTTP or a minimal query language)
 

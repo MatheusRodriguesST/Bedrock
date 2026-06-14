@@ -1,6 +1,7 @@
 //! Bedrock — an append-only key/value storage engine with an in-memory index
-//! (Bitcask-style). Writes append a length-prefixed, CRC32-checked record to a log
-//! and fsync it; the index maps each key to the on-disk offset of its value.
+//! (Bitcask-style). Writes append a length-prefixed, CRC32-checked record to the
+//! active segment and fsync it; data lives in a directory of segment files, and the
+//! index maps each key to its value's location (segment, offset, length).
 //! See README.md for the on-disk format and durability guarantees.
 
 use std::collections::HashMap;
@@ -8,14 +9,22 @@ use std::fs;
 use std::fs::OpenOptions;
 use std::io::{self, BufReader, Read, Write};
 use std::io::{Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 
 pub struct Db {
+    dir: std::path::PathBuf,
     index: HashMap<String, ValueLoc>,
-    file: fs::File,
+    active_id: u64,
+    active: fs::File,
+    active_size: u64,
+    readers: HashMap<u64, fs::File>,
+    live: Vec<u64>, // segment ids currently live, in replay order (from the manifest)
+    next_id: u64,   // next free segment id (monotonic, never reused)
 }
 
 // Where a key's value lives in the log: byte offset of the value + its length.
 struct ValueLoc {
+    seg: u64,
     offset: u64,
     len: u32,
 }
@@ -24,6 +33,8 @@ struct ValueLoc {
 const HEADER_LEN: u64 = 13;
 const OP_SET: u8 = 0;
 const OP_DEL: u8 = 1;
+const SEGMENT_MAX: u64 = 64 * 1024;
+const COMPACT_AFTER: usize = 3; // compact once this many immutable segments pile up
 
 // Serialize one record: [crc u32][op u8][key_len u32][val_len u32][key][val], LE.
 fn encode_record(op: u8, key: &[u8], val: &[u8]) -> Vec<u8> {
@@ -41,86 +52,189 @@ fn encode_record(op: u8, key: &[u8], val: &[u8]) -> Vec<u8> {
     record
 }
 
-impl Db {
-    pub fn open(path: &str) -> io::Result<Db> {
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(path)?;
+fn seg_path(dir: &Path, id: u64) -> PathBuf {
+    dir.join(format!("{id:06}.seg"))
+}
 
-        let mut index = HashMap::new();
-        let mut reader = BufReader::new(&file);
-        let mut offset: u64 = 0;
+// Replay one segment into the index, applying SET/DEL in file order. Returns the
+// offset just past the last valid record (a torn/corrupt tail ends replay early).
+fn replay_segment(
+    file: &fs::File,
+    seg: u64,
+    index: &mut HashMap<String, ValueLoc>,
+) -> io::Result<u64> {
+    let mut reader = BufReader::new(file);
+    let mut offset: u64 = 0;
 
-        loop {
-            let mut cksum_bytes = [0u8; 4];
-            match reader.read_exact(&mut cksum_bytes) {
-                Ok(()) => {}
-                // EOF here = clean end of log.
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                Err(e) => return Err(e),
-            }
-            let stored_checksum = u32::from_le_bytes(cksum_bytes);
+    loop {
+        let mut cksum_bytes = [0u8; 4];
+        match reader.read_exact(&mut cksum_bytes) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break, // clean end
+            Err(e) => return Err(e),
+        }
+        let stored_checksum = u32::from_le_bytes(cksum_bytes);
 
-            // op(1) + key_len(4) + val_len(4) = 9 bytes. A short read = torn tail.
-            let mut header = [0u8; 9];
-            if reader.read_exact(&mut header).is_err() {
-                break;
-            }
-            let op = header[0];
-            let key_len = u32::from_le_bytes(header[1..5].try_into().unwrap()) as usize;
-            let val_len = u32::from_le_bytes(header[5..9].try_into().unwrap()) as usize;
+        let mut header = [0u8; 9];
+        if reader.read_exact(&mut header).is_err() {
+            break;
+        }
+        let op = header[0];
+        let key_len = u32::from_le_bytes(header[1..5].try_into().unwrap()) as usize;
+        let val_len = u32::from_le_bytes(header[5..9].try_into().unwrap()) as usize;
 
-            let mut payload = vec![0u8; key_len + val_len];
-            if reader.read_exact(&mut payload).is_err() {
-                break;
-            }
-
-            // Recompute the CRC over the exact bytes encode_record hashed.
-            let mut body = Vec::new();
-            body.extend_from_slice(&header);
-            body.extend_from_slice(&payload);
-            if crc32fast::hash(&body) != stored_checksum {
-                break; // torn / corrupted tail
-            }
-
-            let key = String::from_utf8(payload[..key_len].to_vec()).unwrap();
-            if op == OP_SET {
-                let value_offset = offset + HEADER_LEN + key_len as u64;
-                index.insert(
-                    key,
-                    ValueLoc {
-                        offset: value_offset,
-                        len: val_len as u32,
-                    },
-                );
-            } else if op == OP_DEL {
-                index.remove(&key);
-            }
-            offset += 4 + 9 + key_len as u64 + val_len as u64;
+        let mut payload = vec![0u8; key_len + val_len];
+        if reader.read_exact(&mut payload).is_err() {
+            break;
         }
 
-        Ok(Db { index, file })
+        let mut body = Vec::new();
+        body.extend_from_slice(&header);
+        body.extend_from_slice(&payload);
+        if crc32fast::hash(&body) != stored_checksum {
+            break; // torn / corrupted tail
+        }
+
+        let key = String::from_utf8(payload[..key_len].to_vec()).unwrap();
+        if op == OP_SET {
+            let value_offset = offset + HEADER_LEN + key_len as u64;
+            index.insert(
+                key,
+                ValueLoc {
+                    seg,
+                    offset: value_offset,
+                    len: val_len as u32,
+                },
+            );
+        } else if op == OP_DEL {
+            index.remove(&key);
+        }
+        offset += 4 + 9 + key_len as u64 + val_len as u64;
+    }
+
+    Ok(offset)
+}
+
+fn manifest_path(dir: &Path) -> PathBuf {
+    dir.join("manifest")
+}
+
+// The manifest is the source of truth for which segments are live and in what replay
+// order (oldest first), one id per line. Returns None if it doesn't exist yet.
+fn read_manifest(dir: &Path) -> io::Result<Option<Vec<u64>>> {
+    match fs::read_to_string(manifest_path(dir)) {
+        Ok(s) => Ok(Some(
+            s.lines()
+                .filter_map(|l| l.trim().parse::<u64>().ok())
+                .collect(),
+        )),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+// Write the live list atomically: write a temp file, fsync it, then rename over the
+// manifest (atomic on POSIX). This is what makes compaction crash-safe — the live set
+// flips in one step. (Dir fsync is best-effort; the rename itself is already atomic.)
+fn write_manifest(dir: &Path, live: &[u64]) -> io::Result<()> {
+    let body: String = live.iter().map(|id| format!("{id}\n")).collect();
+    let tmp = dir.join("manifest.tmp");
+    {
+        let mut f = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)?;
+        f.write_all(body.as_bytes())?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, manifest_path(dir))?;
+    let _ = fs::File::open(dir).and_then(|f| f.sync_all());
+    Ok(())
+}
+
+impl Db {
+    /// Open (or create) the segment directory and rebuild the index by replaying the
+    /// live segments listed in the manifest, in order (so newer writes win).
+    pub fn open(path: &str) -> io::Result<Db> {
+        let dir = PathBuf::from(path);
+        fs::create_dir_all(&dir)?;
+
+        // The manifest lists the live segments in replay order; a fresh directory
+        // starts with one empty segment.
+        let live = match read_manifest(&dir)? {
+            Some(ids) if !ids.is_empty() => ids,
+            _ => {
+                write_manifest(&dir, &[1])?;
+                vec![1]
+            }
+        };
+
+        // Ensure the active segment file exists (fresh directory), then replay every
+        // live segment in order, keeping a read handle per segment.
+        let active_id = *live.last().unwrap();
+        let active = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(seg_path(&dir, active_id))?;
+
+        let mut index = HashMap::new();
+        let mut readers = HashMap::new();
+        let mut active_end = 0u64;
+        for &id in &live {
+            let r = OpenOptions::new().read(true).open(seg_path(&dir, id))?;
+            active_end = replay_segment(&r, id, &mut index)?;
+            readers.insert(id, r);
+        }
+
+        // Drop a torn tail on the active segment so future appends stay contiguous.
+        active.set_len(active_end)?;
+
+        // Any .seg on disk not in the manifest is an orphan from a crashed compaction:
+        // delete it, and make sure new ids never collide with one left behind.
+        let mut max_seen = active_id;
+        for entry in fs::read_dir(&dir)? {
+            let p = entry?.path();
+            if p.extension().and_then(|e| e.to_str()) == Some("seg") {
+                if let Some(id) = p
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
+                    max_seen = max_seen.max(id);
+                    if !live.contains(&id) {
+                        let _ = fs::remove_file(&p);
+                    }
+                }
+            }
+        }
+
+        Ok(Db {
+            dir,
+            index,
+            active_id,
+            active,
+            active_size: active_end,
+            readers,
+            live,
+            next_id: max_seen + 1,
+        })
     }
 
     pub fn set(&mut self, key: String, value: String) -> io::Result<()> {
         let rec = encode_record(OP_SET, key.as_bytes(), value.as_bytes());
-
-        // The record starts at the current end of file (writes are append-only).
-        let record_start = self.file.metadata()?.len();
-        self.file.write_all(&rec)?;
-        self.file.sync_all()?; // fsync before the write counts as committed
+        let (seg, record_start) = self.append(&rec)?;
 
         let value_offset = record_start + HEADER_LEN + key.len() as u64;
         self.index.insert(
             key,
             ValueLoc {
+                seg,
                 offset: value_offset,
                 len: value.len() as u32,
             },
         );
-        Ok(())
+        self.maybe_compact()
     }
 
     pub fn get(&self, key: &str) -> io::Result<Option<String>> {
@@ -130,20 +244,200 @@ impl Db {
         };
 
         // Seek to the value's offset and read exactly its bytes from disk.
-        (&self.file).seek(SeekFrom::Start(loc.offset))?;
+        let mut r = &self.readers[&loc.seg];
+        r.seek(SeekFrom::Start(loc.offset))?;
         let mut buf = vec![0u8; loc.len as usize];
-        (&self.file).read_exact(&mut buf)?;
+        r.read_exact(&mut buf)?;
+
         Ok(Some(String::from_utf8(buf).unwrap()))
     }
 
     pub fn delete(&mut self, key: &str) -> io::Result<()> {
         let rec = encode_record(OP_DEL, key.as_bytes(), &[]);
-
-        self.file.write_all(&rec)?;
-        self.file.sync_all()?;
+        self.append(&rec)?;
         self.index.remove(key);
+        self.maybe_compact()
+    }
+
+    // Append a record to the active segment and fsync it; returns the (segment id,
+    // start offset) where it landed. Rolls to a new segment afterwards if the active
+    // one crossed SEGMENT_MAX, so the returned location still points at this record.
+    fn append(&mut self, rec: &[u8]) -> io::Result<(u64, u64)> {
+        let seg = self.active_id;
+        let record_start = self.active_size;
+
+        self.active.write_all(rec)?;
+        self.active.sync_all()?; // fsync before the write counts as committed
+        self.active_size += rec.len() as u64;
+
+        if self.active_size >= SEGMENT_MAX {
+            self.roll()?;
+        }
+        Ok((seg, record_start))
+    }
+
+    fn roll(&mut self) -> io::Result<()> {
+        let new_id = self.next_id;
+        let seg = seg_path(&self.dir, new_id);
+        let active = OpenOptions::new().create(true).append(true).open(&seg)?;
+        let reader = OpenOptions::new().read(true).open(&seg)?;
+
+        // Record the new segment in the manifest before switching to it, so a crash
+        // can never leave a written-to segment the manifest doesn't know about.
+        let mut live = self.live.clone();
+        live.push(new_id);
+        write_manifest(&self.dir, &live)?;
+
+        self.live = live;
+        self.active = active;
+        self.readers.insert(new_id, reader);
+        self.active_id = new_id;
+        self.active_size = 0;
+        self.next_id = new_id + 1;
         Ok(())
     }
+
+    // Compact once enough immutable segments have piled up. Must be called AFTER the
+    // index reflects the latest write — otherwise a compaction running in the same
+    // call would delete the segment holding a just-written, not-yet-indexed record.
+    fn maybe_compact(&mut self) -> io::Result<()> {
+        if self.live.len() > COMPACT_AFTER {
+            self.compact()?;
+        }
+        Ok(())
+    }
+
+    /// Merge every immutable segment (all but the active) into one fresh segment,
+    /// keeping only the latest value per key, then atomically swap the manifest and
+    /// drop the old segments.
+    ///
+    /// Crash-safe via the manifest: a crash before the swap leaves the old set live
+    /// (the new segment is an ignored orphan); a crash after leaves the new set live
+    /// (the old segments are ignored orphans, cleaned up on the next open).
+    pub fn compact(&mut self) -> io::Result<()> {
+        let immutable: Vec<u64> = self
+            .live
+            .iter()
+            .copied()
+            .filter(|&id| id != self.active_id)
+            .collect();
+        if immutable.is_empty() {
+            return Ok(());
+        }
+
+        // Write the latest value of every key that currently lives in an immutable
+        // segment into one new compacted segment.
+        let comp_id = self.next_id;
+        let comp_path = seg_path(&self.dir, comp_id);
+        let mut comp = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&comp_path)?;
+
+        let keys: Vec<String> = self
+            .index
+            .iter()
+            .filter(|(_, loc)| immutable.contains(&loc.seg))
+            .map(|(k, _)| k.clone())
+            .collect();
+
+        let mut new_locs = Vec::with_capacity(keys.len());
+        let mut offset = 0u64;
+        for key in keys {
+            let value = self.get(&key)?.expect("indexed key must have a value");
+            let rec = encode_record(OP_SET, key.as_bytes(), value.as_bytes());
+            comp.write_all(&rec)?;
+            let value_offset = offset + HEADER_LEN + key.len() as u64;
+            new_locs.push((
+                key,
+                ValueLoc {
+                    seg: comp_id,
+                    offset: value_offset,
+                    len: value.len() as u32,
+                },
+            ));
+            offset += rec.len() as u64;
+        }
+        comp.sync_all()?;
+
+        // Atomic swap: compacted segment first (older data), then the active segment.
+        let new_live = vec![comp_id, self.active_id];
+        write_manifest(&self.dir, &new_live)?;
+
+        // Commit in memory and drop the old segments.
+        self.readers
+            .insert(comp_id, OpenOptions::new().read(true).open(&comp_path)?);
+        for (key, loc) in new_locs {
+            self.index.insert(key, loc);
+        }
+        for id in &immutable {
+            self.readers.remove(id);
+            let _ = fs::remove_file(seg_path(&self.dir, *id));
+        }
+        self.live = new_live;
+        self.next_id = comp_id + 1;
+        Ok(())
+    }
+
+    /// Introspection snapshot for the observer tool (see `playground/observer`).
+    /// Read-only; not a stability guarantee.
+    #[doc(hidden)]
+    pub fn debug_status(&self) -> io::Result<DebugStatus> {
+        let mut segments = Vec::with_capacity(self.live.len());
+        for &id in &self.live {
+            let size = fs::metadata(seg_path(&self.dir, id))?.len();
+            segments.push(SegInfo {
+                id,
+                size,
+                is_active: id == self.active_id,
+            });
+        }
+        segments.sort_by_key(|s| s.id);
+
+        let mut index: Vec<IndexEntry> = self
+            .index
+            .iter()
+            .map(|(k, loc)| IndexEntry {
+                key: k.clone(),
+                seg: loc.seg,
+                offset: loc.offset,
+                len: loc.len,
+            })
+            .collect();
+        index.sort_by(|a, b| a.key.cmp(&b.key));
+
+        Ok(DebugStatus {
+            active_id: self.active_id,
+            segments,
+            index,
+        })
+    }
+}
+
+/// Read-only snapshot of internal state for the observer tool. Introspection only.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct DebugStatus {
+    pub active_id: u64,
+    pub segments: Vec<SegInfo>,
+    pub index: Vec<IndexEntry>,
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct SegInfo {
+    pub id: u64,
+    pub size: u64,
+    pub is_active: bool,
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct IndexEntry {
+    pub key: String,
+    pub seg: u64,
+    pub offset: u64,
+    pub len: u32,
 }
 
 #[cfg(test)]
@@ -151,18 +445,26 @@ mod tests {
     use super::*;
     use std::fs;
 
-    // Each test gets its own log file: tests run in parallel, so a shared path
-    // would let one test corrupt another's state.
-    fn temp_path(name: &str) -> std::path::PathBuf {
+    // Each test gets its own segment directory; tests run in parallel, so a shared
+    // path would let one test corrupt another's state.
+    fn temp_dir(name: &str) -> std::path::PathBuf {
         let mut p = std::env::temp_dir();
-        p.push(format!("bedrock-test-{}-{}.db", std::process::id(), name));
-        let _ = fs::remove_file(&p);
+        p.push(format!("bedrock-test-{}-{}", std::process::id(), name));
+        let _ = fs::remove_dir_all(&p);
         p
+    }
+
+    fn count_segs(dir: &str) -> usize {
+        fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("seg"))
+            .count()
     }
 
     #[test]
     fn set_then_get() {
-        let path = temp_path("set-get");
+        let path = temp_dir("set-get");
         let p = path.to_str().unwrap();
         let mut db = Db::open(p).unwrap();
 
@@ -171,12 +473,12 @@ mod tests {
         assert_eq!(db.get("name").unwrap().as_deref(), Some("matheus"));
         assert_eq!(db.get("missing").unwrap(), None);
 
-        let _ = fs::remove_file(p);
+        let _ = fs::remove_dir_all(p);
     }
 
     #[test]
     fn delete_removes_key() {
-        let path = temp_path("del");
+        let path = temp_dir("del");
         let p = path.to_str().unwrap();
         let mut db = Db::open(p).unwrap();
 
@@ -185,14 +487,14 @@ mod tests {
 
         assert_eq!(db.get("name").unwrap(), None);
 
-        let _ = fs::remove_file(p);
+        let _ = fs::remove_dir_all(p);
     }
 
     // Deletes must survive a restart: the tombstone is replayed on open, so a
     // previously SET key stays gone instead of resurrecting.
     #[test]
     fn delete_survives_reopen() {
-        let path = temp_path("del-reopen");
+        let path = temp_dir("del-reopen");
         let p = path.to_str().unwrap();
 
         {
@@ -206,6 +508,152 @@ mod tests {
         assert_eq!(db.get("name").unwrap(), None);
         assert_eq!(db.get("city").unwrap().as_deref(), Some("sao-paulo"));
 
-        let _ = fs::remove_file(p);
+        let _ = fs::remove_dir_all(p);
+    }
+
+    // Writing past SEGMENT_MAX must roll into new segments, and reopening must
+    // discover and replay all of them — not just the first.
+    #[test]
+    fn rollover_and_reopen_across_segments() {
+        let path = temp_dir("rollover");
+        let p = path.to_str().unwrap();
+
+        let n = 200u64;
+        let big = "x".repeat(2000); // ~2 KiB values force a rollover past 64 KiB
+        {
+            let mut db = Db::open(p).unwrap();
+            for i in 0..n {
+                db.set(format!("key-{i}"), format!("{big}-{i}")).unwrap();
+            }
+            assert!(
+                count_segs(p) > 1,
+                "expected multiple segments after rollover, got {}",
+                count_segs(p)
+            );
+        }
+
+        // Reopen: discovery must replay every segment, so all keys survive.
+        let db = Db::open(p).unwrap();
+        for i in 0..n {
+            assert_eq!(
+                db.get(&format!("key-{i}")).unwrap(),
+                Some(format!("{big}-{i}")),
+                "key-{i} lost across a multi-segment reopen"
+            );
+        }
+
+        let _ = fs::remove_dir_all(p);
+    }
+
+    // A crash can leave a half-written record at the tail. After such an unclean
+    // recovery, a newly written key must still survive a later reopen — i.e. open()
+    // must drop the torn tail so appends land contiguously.
+    #[test]
+    fn write_after_unclean_recovery_survives() {
+        use std::io::Write as _;
+        let path = temp_dir("torn-tail");
+        let p = path.to_str().unwrap();
+
+        {
+            let mut db = Db::open(p).unwrap();
+            db.set("a".to_string(), "1".to_string()).unwrap();
+            db.set("b".to_string(), "2".to_string()).unwrap();
+        }
+
+        // Simulate a crash mid-write: append garbage to the active segment's tail.
+        {
+            let seg = path.join("000001.seg");
+            let mut f = fs::OpenOptions::new().append(true).open(&seg).unwrap();
+            f.write_all(&[0xAB; 8]).unwrap(); // not a valid record
+        }
+
+        // Reopen after the torn tail, write a new key, close.
+        {
+            let mut db = Db::open(p).unwrap();
+            db.set("c".to_string(), "3".to_string()).unwrap();
+        }
+
+        // Reopen again: old and new keys must all be present (the torn tail was dropped).
+        let db = Db::open(p).unwrap();
+        assert_eq!(db.get("a").unwrap().as_deref(), Some("1"));
+        assert_eq!(db.get("b").unwrap().as_deref(), Some("2"));
+        assert_eq!(db.get("c").unwrap().as_deref(), Some("3"));
+
+        let _ = fs::remove_dir_all(p);
+    }
+
+    // Many overwrites create lots of dead records and roll many segments. Compaction
+    // must collapse them while preserving the latest value of every key — and the
+    // result must survive a reopen (the manifest points at the compacted set).
+    #[test]
+    fn compaction_reclaims_dead_data_and_preserves_values() {
+        let path = temp_dir("compaction");
+        let p = path.to_str().unwrap();
+
+        let n = 40u64;
+        let big = "y".repeat(2000); // ~2 KiB values -> frequent rollovers
+        {
+            let mut db = Db::open(p).unwrap();
+            for round in 0..20 {
+                for i in 0..n {
+                    db.set(format!("key-{i}"), format!("{big}-r{round}-{i}"))
+                        .unwrap();
+                }
+            }
+            // Without compaction this would be ~25 segments; with it, only a few.
+            assert!(
+                count_segs(p) <= COMPACT_AFTER + 2,
+                "compaction did not collapse segments: {} live",
+                count_segs(p)
+            );
+            for i in 0..n {
+                assert_eq!(
+                    db.get(&format!("key-{i}")).unwrap(),
+                    Some(format!("{big}-r19-{i}"))
+                );
+            }
+        }
+
+        // The compacted set must replay correctly on reopen.
+        let db = Db::open(p).unwrap();
+        for i in 0..n {
+            assert_eq!(
+                db.get(&format!("key-{i}")).unwrap(),
+                Some(format!("{big}-r19-{i}")),
+                "key-{i} wrong after compaction + reopen"
+            );
+        }
+
+        let _ = fs::remove_dir_all(p);
+    }
+
+    // A crash mid-compaction can leave a .seg on disk that the manifest never adopted.
+    // Open must ignore (and clean up) that orphan and keep the real data intact.
+    #[test]
+    fn orphan_segment_is_ignored_on_open() {
+        use std::io::Write as _;
+        let path = temp_dir("orphan");
+        let p = path.to_str().unwrap();
+
+        {
+            let mut db = Db::open(p).unwrap();
+            db.set("a".to_string(), "1".to_string()).unwrap();
+        }
+
+        // A .seg the manifest doesn't list (as a crashed compaction would leave).
+        {
+            let orphan = path.join("009999.seg");
+            let mut f = fs::File::create(&orphan).unwrap();
+            f.write_all(b"garbage not in the manifest").unwrap();
+        }
+
+        let db = Db::open(p).unwrap();
+        assert_eq!(db.get("a").unwrap().as_deref(), Some("1"));
+        assert!(
+            !path.join("009999.seg").exists(),
+            "orphan segment should be deleted on open"
+        );
+
+        let _ = fs::remove_dir_all(p);
     }
 }
