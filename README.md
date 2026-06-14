@@ -10,6 +10,14 @@ It is a learning-by-building project focused on database internals: on-disk stor
 durability, crash recovery, and indexing. Design decisions and their trade-offs are
 documented below — that is the point of the project as much as the code.
 
+**Highlights**
+
+- Custom binary, length-prefixed on-disk format with a per-record **CRC32**.
+- **`fsync` on every write** (`F_FULLFSYNC` on macOS) → crash durability, proven by a SIGKILL test.
+- In-memory **offset index** (Bitcask-style): values stay on disk, so the dataset can exceed RAM.
+- Log-structured **segments + crash-safe compaction** (atomic manifest swap).
+- **Benchmarked vs SQLite** under matched durability; CI runs fmt + clippy + tests on every push.
+
 ## Status & guarantees
 
 | Property | Guarantee |
@@ -24,8 +32,8 @@ documented below — that is the point of the project as much as the code.
 Bedrock is a **Bitcask-style** engine (see *Designing Data-Intensive Applications*,
 ch. 3, "Hash Indexes"):
 
-- **Append-only log.** Every `set`/`delete` appends one record to the end of a single
-  data file. Nothing is ever updated in place.
+- **Append-only log.** Every `set`/`delete` appends one record to the active segment.
+  Nothing is ever updated in place.
 - **In-memory index.** A hash map maps each key to the **on-disk location** of its
   value (`offset + length`) — not the value itself. RAM usage scales with the *number
   of keys*, not the total size of the values, so the dataset can exceed RAM. Reads do
