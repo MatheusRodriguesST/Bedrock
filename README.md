@@ -57,20 +57,35 @@ values are safe and a half-written record at the tail is unambiguous.
 
 Measured with [Criterion](https://github.com/bheisler/criterion.rs) on a development
 laptop (macOS); reproduce with `cargo bench`. Absolute numbers are hardware-dependent —
-the **ratios** are the point.
+the ratios and the comparison below are the point.
 
 | Operation | Latency | Throughput |
 |-----------|---------|------------|
-| `set` (append + fsync) | ~2.7 ms | ~370 ops/s |
-| `get` (index + seek + read, warm cache) | ~740 ns | ~1.35M ops/s |
+| `set` (append + fsync) | ~2.6 ms | ~385 ops/s |
+| `get` (index + seek + read, warm cache) | ~770 ns | ~1.3M ops/s |
 | `open` (replay 10k records) | ~1.5 ms | ~150 ns/record |
 
-**Reads are ~3,600× faster than writes** — because each write pays a real durability
-barrier. On macOS, Rust's `File::sync_all` issues `F_FULLFSYNC`, which forces data all
-the way to the physical medium rather than just to the drive's write cache. That ~2.7 ms
-is the honest cost of *true* crash durability, not a weaker `fsync`. It also motivates a
-future **group-commit** optimization (batch many writes behind one flush) to trade
-latency for throughput.
+Reads pay no durability barrier; writes do — which is why writes are ~3,000× slower. On
+macOS, `File::sync_all` issues `F_FULLFSYNC`, forcing data to the physical medium (not just
+the drive cache), so that ~2.6 ms is the honest cost of *true* crash durability. It also
+motivates a future **group-commit** optimization (batch writes behind one flush).
+
+### vs SQLite (matched durability)
+
+Same workload against SQLite in WAL mode with `synchronous=FULL` + `fullfsync=ON`, so both
+engines fsync every write to survive a machine crash. They are different designs — Bedrock
+is an append-only KV log, SQLite a B-tree SQL engine — so this is positioning, not a contest
+(`cargo bench --bench compare`):
+
+| Operation | Bedrock | SQLite |
+|-----------|---------|--------|
+| write (fsync per write) | ~2.6 ms | ~2.8 ms |
+| read (point lookup) | ~0.77 µs | ~2.15 µs |
+
+Writes land in the same ballpark: both are dominated by the fsync barrier, so the cost is
+durability, not the engine. On point reads Bedrock is ~3× faster — a hash-index lookup plus
+one `seek`+`read` beats SQL parsing and a B-tree descent, which is the upside of a
+specialized key/value store over a general SQL engine.
 
 ## Design decisions & trade-offs
 
