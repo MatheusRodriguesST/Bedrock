@@ -18,6 +18,8 @@ pub struct Db {
     active: fs::File,
     active_size: u64,
     readers: HashMap<u64, fs::File>,
+    live: Vec<u64>, // segment ids currently live, in replay order (from the manifest)
+    next_id: u64,   // next free segment id (monotonic, never reused)
 }
 
 // Where a key's value lives in the log: byte offset of the value + its length.
@@ -32,6 +34,7 @@ const HEADER_LEN: u64 = 13;
 const OP_SET: u8 = 0;
 const OP_DEL: u8 = 1;
 const SEGMENT_MAX: u64 = 64 * 1024;
+const COMPACT_AFTER: usize = 3; // compact once this many immutable segments pile up
 
 // Serialize one record: [crc u32][op u8][key_len u32][val_len u32][key][val], LE.
 fn encode_record(op: u8, key: &[u8], val: &[u8]) -> Vec<u8> {
@@ -112,61 +115,109 @@ fn replay_segment(
     Ok(offset)
 }
 
+fn manifest_path(dir: &Path) -> PathBuf {
+    dir.join("manifest")
+}
+
+// The manifest is the source of truth for which segments are live and in what replay
+// order (oldest first), one id per line. Returns None if it doesn't exist yet.
+fn read_manifest(dir: &Path) -> io::Result<Option<Vec<u64>>> {
+    match fs::read_to_string(manifest_path(dir)) {
+        Ok(s) => Ok(Some(
+            s.lines()
+                .filter_map(|l| l.trim().parse::<u64>().ok())
+                .collect(),
+        )),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+// Write the live list atomically: write a temp file, fsync it, then rename over the
+// manifest (atomic on POSIX). This is what makes compaction crash-safe — the live set
+// flips in one step. (Dir fsync is best-effort; the rename itself is already atomic.)
+fn write_manifest(dir: &Path, live: &[u64]) -> io::Result<()> {
+    let body: String = live.iter().map(|id| format!("{id}\n")).collect();
+    let tmp = dir.join("manifest.tmp");
+    {
+        let mut f = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)?;
+        f.write_all(body.as_bytes())?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, manifest_path(dir))?;
+    let _ = fs::File::open(dir).and_then(|f| f.sync_all());
+    Ok(())
+}
+
 impl Db {
-    /// Open (or create) the segment directory and rebuild the index by replaying
-    /// every segment in order (oldest id first, so newer writes win).
+    /// Open (or create) the segment directory and rebuild the index by replaying the
+    /// live segments listed in the manifest, in order (so newer writes win).
     pub fn open(path: &str) -> io::Result<Db> {
         let dir = PathBuf::from(path);
         fs::create_dir_all(&dir)?;
 
-        // Discover existing segment ids (ascending = oldest -> newest).
-        let mut ids: Vec<u64> = Vec::new();
+        // The manifest lists the live segments in replay order; a fresh directory
+        // starts with one empty segment.
+        let live = match read_manifest(&dir)? {
+            Some(ids) if !ids.is_empty() => ids,
+            _ => {
+                write_manifest(&dir, &[1])?;
+                vec![1]
+            }
+        };
+
+        // Ensure the active segment file exists (fresh directory), then replay every
+        // live segment in order, keeping a read handle per segment.
+        let active_id = *live.last().unwrap();
+        let active = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(seg_path(&dir, active_id))?;
+
+        let mut index = HashMap::new();
+        let mut readers = HashMap::new();
+        let mut active_end = 0u64;
+        for &id in &live {
+            let r = OpenOptions::new().read(true).open(seg_path(&dir, id))?;
+            active_end = replay_segment(&r, id, &mut index)?;
+            readers.insert(id, r);
+        }
+
+        // Drop a torn tail on the active segment so future appends stay contiguous.
+        active.set_len(active_end)?;
+
+        // Any .seg on disk not in the manifest is an orphan from a crashed compaction:
+        // delete it, and make sure new ids never collide with one left behind.
+        let mut max_seen = active_id;
         for entry in fs::read_dir(&dir)? {
             let p = entry?.path();
             if p.extension().and_then(|e| e.to_str()) == Some("seg") {
                 if let Some(id) = p
                     .file_stem()
                     .and_then(|s| s.to_str())
-                    .and_then(|s| s.parse().ok())
+                    .and_then(|s| s.parse::<u64>().ok())
                 {
-                    ids.push(id);
+                    max_seen = max_seen.max(id);
+                    if !live.contains(&id) {
+                        let _ = fs::remove_file(&p);
+                    }
                 }
             }
         }
-        ids.sort_unstable();
-
-        // Replay each segment into the index, keeping a read handle per segment.
-        // replay_segment returns the offset just past the last valid record; for the
-        // last (active) segment that is the boundary future appends must start at.
-        let mut index = HashMap::new();
-        let mut readers = HashMap::new();
-        let mut active_end = 0u64;
-        for &id in &ids {
-            let r = OpenOptions::new().read(true).open(seg_path(&dir, id))?;
-            active_end = replay_segment(&r, id, &mut index)?;
-            readers.insert(id, r);
-        }
-
-        // Active segment = highest existing id, or 1 for a fresh directory.
-        let active_id = ids.last().copied().unwrap_or(1);
-        let seg = seg_path(&dir, active_id);
-        let active = OpenOptions::new().create(true).append(true).open(&seg)?;
-        // A fresh directory has no reader for the active segment yet.
-        if ids.is_empty() {
-            readers.insert(active_id, OpenOptions::new().read(true).open(&seg)?);
-        }
-        // Drop a torn tail left by a crash so future appends stay contiguous
-        // (no-op on a clean segment, where active_end == the file size).
-        active.set_len(active_end)?;
-        let active_size = active_end;
 
         Ok(Db {
             dir,
             index,
             active_id,
             active,
-            active_size,
+            active_size: active_end,
             readers,
+            live,
+            next_id: max_seen + 1,
         })
     }
 
@@ -183,7 +234,7 @@ impl Db {
                 len: value.len() as u32,
             },
         );
-        Ok(())
+        self.maybe_compact()
     }
 
     pub fn get(&self, key: &str) -> io::Result<Option<String>> {
@@ -205,7 +256,7 @@ impl Db {
         let rec = encode_record(OP_DEL, key.as_bytes(), &[]);
         self.append(&rec)?;
         self.index.remove(key);
-        Ok(())
+        self.maybe_compact()
     }
 
     // Append a record to the active segment and fsync it; returns the (segment id,
@@ -226,14 +277,167 @@ impl Db {
     }
 
     fn roll(&mut self) -> io::Result<()> {
-        self.active_id += 1;
-        let seg = seg_path(&self.dir, self.active_id);
-        self.active = OpenOptions::new().create(true).append(true).open(&seg)?;
-        self.readers
-            .insert(self.active_id, OpenOptions::new().read(true).open(&seg)?);
+        let new_id = self.next_id;
+        let seg = seg_path(&self.dir, new_id);
+        let active = OpenOptions::new().create(true).append(true).open(&seg)?;
+        let reader = OpenOptions::new().read(true).open(&seg)?;
+
+        // Record the new segment in the manifest before switching to it, so a crash
+        // can never leave a written-to segment the manifest doesn't know about.
+        let mut live = self.live.clone();
+        live.push(new_id);
+        write_manifest(&self.dir, &live)?;
+
+        self.live = live;
+        self.active = active;
+        self.readers.insert(new_id, reader);
+        self.active_id = new_id;
         self.active_size = 0;
+        self.next_id = new_id + 1;
         Ok(())
     }
+
+    // Compact once enough immutable segments have piled up. Must be called AFTER the
+    // index reflects the latest write — otherwise a compaction running in the same
+    // call would delete the segment holding a just-written, not-yet-indexed record.
+    fn maybe_compact(&mut self) -> io::Result<()> {
+        if self.live.len() > COMPACT_AFTER {
+            self.compact()?;
+        }
+        Ok(())
+    }
+
+    /// Merge every immutable segment (all but the active) into one fresh segment,
+    /// keeping only the latest value per key, then atomically swap the manifest and
+    /// drop the old segments.
+    ///
+    /// Crash-safe via the manifest: a crash before the swap leaves the old set live
+    /// (the new segment is an ignored orphan); a crash after leaves the new set live
+    /// (the old segments are ignored orphans, cleaned up on the next open).
+    pub fn compact(&mut self) -> io::Result<()> {
+        let immutable: Vec<u64> = self
+            .live
+            .iter()
+            .copied()
+            .filter(|&id| id != self.active_id)
+            .collect();
+        if immutable.is_empty() {
+            return Ok(());
+        }
+
+        // Write the latest value of every key that currently lives in an immutable
+        // segment into one new compacted segment.
+        let comp_id = self.next_id;
+        let comp_path = seg_path(&self.dir, comp_id);
+        let mut comp = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&comp_path)?;
+
+        let keys: Vec<String> = self
+            .index
+            .iter()
+            .filter(|(_, loc)| immutable.contains(&loc.seg))
+            .map(|(k, _)| k.clone())
+            .collect();
+
+        let mut new_locs = Vec::with_capacity(keys.len());
+        let mut offset = 0u64;
+        for key in keys {
+            let value = self.get(&key)?.expect("indexed key must have a value");
+            let rec = encode_record(OP_SET, key.as_bytes(), value.as_bytes());
+            comp.write_all(&rec)?;
+            let value_offset = offset + HEADER_LEN + key.len() as u64;
+            new_locs.push((
+                key,
+                ValueLoc {
+                    seg: comp_id,
+                    offset: value_offset,
+                    len: value.len() as u32,
+                },
+            ));
+            offset += rec.len() as u64;
+        }
+        comp.sync_all()?;
+
+        // Atomic swap: compacted segment first (older data), then the active segment.
+        let new_live = vec![comp_id, self.active_id];
+        write_manifest(&self.dir, &new_live)?;
+
+        // Commit in memory and drop the old segments.
+        self.readers
+            .insert(comp_id, OpenOptions::new().read(true).open(&comp_path)?);
+        for (key, loc) in new_locs {
+            self.index.insert(key, loc);
+        }
+        for id in &immutable {
+            self.readers.remove(id);
+            let _ = fs::remove_file(seg_path(&self.dir, *id));
+        }
+        self.live = new_live;
+        self.next_id = comp_id + 1;
+        Ok(())
+    }
+
+    /// Introspection snapshot for the observer tool (see `playground/observer`).
+    /// Read-only; not a stability guarantee.
+    #[doc(hidden)]
+    pub fn debug_status(&self) -> io::Result<DebugStatus> {
+        let mut segments = Vec::with_capacity(self.live.len());
+        for &id in &self.live {
+            let size = fs::metadata(seg_path(&self.dir, id))?.len();
+            segments.push(SegInfo {
+                id,
+                size,
+                is_active: id == self.active_id,
+            });
+        }
+        segments.sort_by_key(|s| s.id);
+
+        let mut index: Vec<IndexEntry> = self
+            .index
+            .iter()
+            .map(|(k, loc)| IndexEntry {
+                key: k.clone(),
+                seg: loc.seg,
+                offset: loc.offset,
+                len: loc.len,
+            })
+            .collect();
+        index.sort_by(|a, b| a.key.cmp(&b.key));
+
+        Ok(DebugStatus {
+            active_id: self.active_id,
+            segments,
+            index,
+        })
+    }
+}
+
+/// Read-only snapshot of internal state for the observer tool. Introspection only.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct DebugStatus {
+    pub active_id: u64,
+    pub segments: Vec<SegInfo>,
+    pub index: Vec<IndexEntry>,
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct SegInfo {
+    pub id: u64,
+    pub size: u64,
+    pub is_active: bool,
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct IndexEntry {
+    pub key: String,
+    pub seg: u64,
+    pub offset: u64,
+    pub len: u32,
 }
 
 #[cfg(test)]
@@ -248,6 +452,14 @@ mod tests {
         p.push(format!("bedrock-test-{}-{}", std::process::id(), name));
         let _ = fs::remove_dir_all(&p);
         p
+    }
+
+    fn count_segs(dir: &str) -> usize {
+        fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("seg"))
+            .count()
     }
 
     #[test]
@@ -313,10 +525,10 @@ mod tests {
             for i in 0..n {
                 db.set(format!("key-{i}"), format!("{big}-{i}")).unwrap();
             }
-            let segs = fs::read_dir(p).unwrap().count();
             assert!(
-                segs > 1,
-                "expected multiple segments after rollover, got {segs}"
+                count_segs(p) > 1,
+                "expected multiple segments after rollover, got {}",
+                count_segs(p)
             );
         }
 
@@ -366,6 +578,81 @@ mod tests {
         assert_eq!(db.get("a").unwrap().as_deref(), Some("1"));
         assert_eq!(db.get("b").unwrap().as_deref(), Some("2"));
         assert_eq!(db.get("c").unwrap().as_deref(), Some("3"));
+
+        let _ = fs::remove_dir_all(p);
+    }
+
+    // Many overwrites create lots of dead records and roll many segments. Compaction
+    // must collapse them while preserving the latest value of every key — and the
+    // result must survive a reopen (the manifest points at the compacted set).
+    #[test]
+    fn compaction_reclaims_dead_data_and_preserves_values() {
+        let path = temp_dir("compaction");
+        let p = path.to_str().unwrap();
+
+        let n = 40u64;
+        let big = "y".repeat(2000); // ~2 KiB values -> frequent rollovers
+        {
+            let mut db = Db::open(p).unwrap();
+            for round in 0..20 {
+                for i in 0..n {
+                    db.set(format!("key-{i}"), format!("{big}-r{round}-{i}"))
+                        .unwrap();
+                }
+            }
+            // Without compaction this would be ~25 segments; with it, only a few.
+            assert!(
+                count_segs(p) <= COMPACT_AFTER + 2,
+                "compaction did not collapse segments: {} live",
+                count_segs(p)
+            );
+            for i in 0..n {
+                assert_eq!(
+                    db.get(&format!("key-{i}")).unwrap(),
+                    Some(format!("{big}-r19-{i}"))
+                );
+            }
+        }
+
+        // The compacted set must replay correctly on reopen.
+        let db = Db::open(p).unwrap();
+        for i in 0..n {
+            assert_eq!(
+                db.get(&format!("key-{i}")).unwrap(),
+                Some(format!("{big}-r19-{i}")),
+                "key-{i} wrong after compaction + reopen"
+            );
+        }
+
+        let _ = fs::remove_dir_all(p);
+    }
+
+    // A crash mid-compaction can leave a .seg on disk that the manifest never adopted.
+    // Open must ignore (and clean up) that orphan and keep the real data intact.
+    #[test]
+    fn orphan_segment_is_ignored_on_open() {
+        use std::io::Write as _;
+        let path = temp_dir("orphan");
+        let p = path.to_str().unwrap();
+
+        {
+            let mut db = Db::open(p).unwrap();
+            db.set("a".to_string(), "1".to_string()).unwrap();
+        }
+
+        // A .seg the manifest doesn't list (as a crashed compaction would leave).
+        {
+            let orphan = path.join("009999.seg");
+            let mut f = fs::File::create(&orphan).unwrap();
+            f.write_all(b"garbage not in the manifest").unwrap();
+        }
+
+        let db = Db::open(p).unwrap();
+        assert_eq!(db.get("a").unwrap().as_deref(), Some("1"));
+        assert!(
+            !path.join("009999.seg").exists(),
+            "orphan segment should be deleted on open"
+        );
 
         let _ = fs::remove_dir_all(p);
     }
