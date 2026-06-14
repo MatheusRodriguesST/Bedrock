@@ -30,8 +30,22 @@ ch. 3, "Hash Indexes"):
   value (`offset + length`) — not the value itself. RAM usage scales with the *number
   of keys*, not the total size of the values, so the dataset can exceed RAM. Reads do
   one `seek + read`; the OS page cache absorbs the cost of hot keys.
-- **Recovery by replay.** On `open`, the log is replayed front to back to rebuild the
-  index. A `DEL` tombstone removes the key, so deletes survive restarts.
+- **Segments + compaction.** The log is split into fixed-size segment files; the active
+  one rolls over when it fills. A size-triggered **compaction** merges the immutable
+  segments into one, keeping only the latest value per key, which reclaims the space held
+  by overwritten and deleted records.
+- **Recovery by replay.** On `open`, the live segments are replayed in order to rebuild
+  the index. A `DEL` tombstone removes the key, so deletes survive restarts.
+
+### Manifest (crash-safe compaction)
+
+A `manifest` file lists the live segments in replay order and is the source of truth for
+which segments are valid. Compaction writes a new segment, fsyncs it, then **atomically
+swaps the manifest** (write-temp + `rename`) before deleting the old segments. A crash
+before the swap leaves the old set live (the new segment is an ignored orphan); a crash
+after leaves the new set live (the old segments are orphans, cleaned up on the next open).
+The swap is the single atomic step that makes compaction safe — the same idea LevelDB and
+RocksDB use.
 
 ### On-disk record format
 
@@ -91,7 +105,7 @@ specialized key/value store over a general SQL engine.
 
 - **Append-only log, not in-place B-Tree.** Appends are sequential writes (fast, simple
   to make crash-safe) at the cost of space: superseded and deleted records linger until
-  **compaction** (roadmap). A B-Tree updates in place — less space amplification, but
+  **compaction** reclaims them. A B-Tree updates in place — less space amplification, but
   in-place writes are harder to make atomic and durable.
 - **Index stores offsets, not values.** Enables datasets larger than RAM, at the cost of
   one disk read per `get` (read amplification), softened by the page cache.
@@ -103,8 +117,7 @@ specialized key/value store over a general SQL engine.
 
 ### What it does **not** do (yet)
 
-Multi-key transactions, concurrent writers, compaction/segment merging, and a network
-API. See the roadmap.
+Multi-key transactions, concurrent writers, and a network API. See the roadmap.
 
 ## Roadmap
 
@@ -113,7 +126,7 @@ API. See the roadmap.
 - [x] `delete` via tombstones
 - [x] Binary length-prefixed format, per-record CRC32, `fsync` → crash durability
 - [x] Offset index (values on disk, not in RAM) — Bitcask-complete
-- [ ] Segments + compaction (reclaim space; foundation for an LSM-tree)
+- [x] Segments + size-triggered, crash-safe compaction (manifest swap)
 - [ ] Concurrency: `RwLock`, then MVCC / snapshot isolation
 - [ ] Network API (HTTP or a minimal query language)
 
