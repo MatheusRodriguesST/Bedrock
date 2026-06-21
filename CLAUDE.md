@@ -88,16 +88,29 @@ ou MVCC para isolamento de transações.
     piso que viva em segmento imutável); descarta o tombstone-piso (recupera chaves deletadas).
     Sem snapshot vivo → colapsa pra 1 versão (= comportamento antigo). 11 unit + concorrência +
     crash. **Degrau 8b fechado.**
-- ⏭️ AGENDADO (degrau 8c, **logo após o 8b.4**): **leituras lock-free** — mover a sincronização
+- ✅ FEITO (degrau 9a): **API de rede** — crate `crates/server` (lib+bin), servidor HTTP/1.1
+  escrito **à mão sobre `std::net`** (sem axum/tokio, mesma postura "sem framework" do formato em
+  disco), **thread-por-conexão** sobre `Arc<RwLock<Db>>` (GET pega `read`, PUT/DELETE pega `write`
+  → a concorrência do 8a/8b visível sob clientes TCP reais). Rotas `GET`/`PUT`/`DELETE /keys/{k}`
+  (+ banner raiz); `204` em escrita, `404`/`405` rota/método, `400` corpo malformado/não-UTF-8,
+  `413` corpo > 64 MiB (rejeitado antes de alocar). Subset honesto: framing por `Content-Length`,
+  `Connection: close`, uma request por conexão (sem keep-alive/chunked/TLS/auth; bind loopback).
+  4 testes de integração (cliente HTTP cru, zero deps; inclui 8 leitores + 1 escritor). Spec e
+  walkthrough em [[10-api-de-rede]]. **Lê o presente — não expõe snapshot por HTTP ainda (é o 9b).**
+- ⏭️ AGENDADO (degrau 8c): **leituras lock-free** — mover a sincronização
   pra dentro do `Db` (`Db: Clone` sobre `Arc<Inner>`), encurtar a seção crítica do `get` (I/O
   fora do lock) e/ou índice imutável com swap atômico → "leitor nunca bloqueia escritor". É o
   refinamento que o 8a/8b deixaram de fora de propósito ("começar grosso, medir, refinar").
+- ⏭️ AGENDADO (degrau 9b): **expor MVCC por HTTP** — `POST /snapshots` + `GET /keys/k?as_of=seq`,
+  com **lease/TTL** no snapshot pra um cliente sumido não travar o GC (`min_live`).
 - 🧭 GARANTIA ATUAL: durabilidade a **crash** (assumindo que o disco honra o fsync) +
   **snapshot isolation com GC consciente de snapshots vivos** (leitor vê foto consistente no
   `seq` em que começou via `snapshot()`/`get_as_of`; compaction não coleta versão que um snapshot
-  vivo ainda alcança). Concorrência ainda por `RwLock` grosso (escritor/compaction bloqueia
-  leituras — "leitor nunca bloqueia escritor" é o 8c). Sem transações multi-chave. Números:
-  `set` ~2,6 ms (vs SQLite ~2,8 ms), `get` ~0,77 µs (vs SQLite ~2,15 µs).
+  vivo ainda alcança) + **API HTTP** (`GET`/`PUT`/`DELETE`; N `GET` em paralelo XOR 1 escritor;
+  reads HTTP veem o presente, não snapshot ainda). Concorrência ainda por `RwLock` grosso
+  (escritor/compaction bloqueia leituras — "leitor nunca bloqueia escritor" é o 8c). Sem
+  transações multi-chave; API sem TLS/auth. Números: `set` ~2,6 ms (vs SQLite ~2,8 ms),
+  `get` ~0,77 µs (vs SQLite ~2,15 µs, ~3× mais rápido em leitura).
 
 ## Roadmap em degraus (cada um resolve a limitação do anterior)
 1. **[FEITO]** `struct Db` + `open` (abre/cria o log, índice em memória)
@@ -108,8 +121,8 @@ ou MVCC para isolamento de transações.
    replay tolera registro rasgado (torn write)
 6. **[FEITO]** Índice de offsets (guarda chave→posição, não o valor) → estilo Bitcask completo
 7. **[FEITO]** Segmentos + compaction (manifesto crash-safe) → base do LSM-tree
-8. Concorrência: **8a [FEITO]** lock (`RwLock`) → **8b [FEITO]** MVCC (snapshot isolation + GC) → **8c [PRÓXIMO]** leituras lock-free (sync dentro do `Db`, I/O fora da seção crítica)
-9. API HTTP / linguagem de query mínima
+8. Concorrência: **8a [FEITO]** lock (`RwLock`) → **8b [FEITO]** MVCC (snapshot isolation + GC) → **8c [MELHORIA]** leituras lock-free (sync dentro do `Db`, I/O fora da seção crítica)
+9. API de rede: **9a [FEITO]** servidor HTTP/1.1 à mão (`GET`/`PUT`/`DELETE`) → **9b [MELHORIA]** expor snapshot por HTTP (`?as_of=seq`) com lease
 
 ## Garantias a documentar no README final
 Atomicidade, isolamento e durabilidade real. Declarar explicitamente, como um banco de
