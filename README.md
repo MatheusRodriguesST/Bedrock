@@ -17,7 +17,8 @@ documented below — that is the point of the project as much as the code.
 - In-memory **offset index** (Bitcask-style): values stay on disk, so the dataset can exceed RAM.
 - Log-structured **segments + crash-safe compaction** (atomic manifest swap).
 - **MVCC snapshot isolation**: readers get a consistent point-in-time view; GC never reclaims a version a live snapshot still needs.
-- **Benchmarked vs SQLite** under matched durability; CI runs fmt + clippy + tests on every push.
+- **HTTP API**: a dependency-free `std::net` server (`GET`/`PUT`/`DELETE`), thread-per-connection over the shared engine.
+- **Benchmarked vs SQLite** under matched durability — **~3× faster point reads** (~0.77 µs vs ~2.15 µs); CI runs fmt + clippy + tests on every push.
 
 ## Status & guarantees
 
@@ -99,6 +100,38 @@ Length-prefixing is what makes torn-write detection possible: the reader reads e
 N bytes per field instead of scanning for a delimiter, so arbitrary bytes in keys and
 values are safe and a half-written record at the tail is unambiguous.
 
+## Network API
+
+A small HTTP/1.1 server (`crates/server`) exposes the engine over the network. The HTTP is
+**hand-rolled over `std::net`** — no `axum`/`tokio` — the same no-framework stance as the
+on-disk format. It is also where the concurrency work becomes visible: the server runs **one
+thread per connection** over a shared `Arc<RwLock<Db>>`, so a `GET` takes the read lock and a
+`PUT`/`DELETE` the write lock — the engine's "many readers xor one writer" guarantee, observed
+over real TCP clients (and exercised by an 8-readers + 1-writer integration test).
+
+```bash
+cargo run -p bedrock-server -- 127.0.0.1:7878 bedrock.db   # ADDR and DB_PATH are optional
+```
+
+| Request | Action | Response |
+|---------|--------|----------|
+| `GET /keys/{key}` | read the value | `200` + value · `404` if absent |
+| `PUT /keys/{key}` (body = value) | store the value | `204` · `400` if body isn't UTF-8 |
+| `DELETE /keys/{key}` | delete the key | `204` (idempotent) |
+| `GET /` | banner | `200` |
+
+```bash
+curl -X PUT --data-binary 'bar' localhost:7878/keys/foo   # 204
+curl localhost:7878/keys/foo                               # 200 -> bar
+curl -i -X DELETE localhost:7878/keys/foo                  # 204
+```
+
+**v1 scope (stated honestly):** one request per connection (no keep-alive or chunked encoding),
+`Content-Length`-framed bodies capped at 64 MiB (`413` above), keys taken verbatim from the path
+(no percent-decoding, so no spaces or `/`), and **no TLS or auth** — it binds loopback by default.
+HTTP reads see the *present*; the engine's snapshot isolation (`get_as_of`) is not exposed over
+HTTP yet (see the roadmap).
+
 ## Benchmarks
 
 Measured with [Criterion](https://github.com/bheisler/criterion.rs) on a development
@@ -146,11 +179,16 @@ specialized key/value store over a general SQL engine.
 - **Durability is verified, not assumed.** `tests/crash_recovery.rs` spawns a writer,
   `SIGKILL`s it mid-write, reopens the log, and asserts that surviving keys form a
   contiguous, uncorrupted prefix — no lost committed data, no replay crash.
+- **Concurrency and the network layer are tested, not just claimed.** The engine's
+  `tests/concurrency.rs` runs many readers against a writer, and the server's `tests/api.rs`
+  drives the real socket end to end — including 8 concurrent readers plus a writer — so the
+  "many readers xor one writer" guarantee is proven at both layers, not asserted in prose.
 
 ### What it does **not** do (yet)
 
-Multi-key transactions, concurrent writers, lock-free reads (readers and writers still
-serialize on a coarse `RwLock`), and a network API. See the roadmap.
+Multi-key transactions, concurrent writers, and lock-free reads (readers and writers still
+serialize on a coarse `RwLock`). The HTTP API has no TLS or auth and does not yet expose
+snapshot reads. See the roadmap.
 
 ## Roadmap
 
@@ -162,13 +200,15 @@ serialize on a coarse `RwLock`), and a network API. See the roadmap.
 - [x] Segments + size-triggered, crash-safe compaction (manifest swap)
 - [x] Concurrent reads: positioned `pread` + `RwLock` sharing (many readers xor one writer)
 - [x] MVCC snapshot isolation + snapshot-aware garbage collection
+- [x] HTTP API: hand-rolled `GET` / `PUT` / `DELETE` over `std::net`, thread-per-connection
 - [ ] Lock-free reads (sync inside `Db`, value I/O out of the critical section)
-- [ ] Network API (HTTP or a minimal query language)
+- [ ] Expose snapshots over HTTP (`?as_of=seq`) with a snapshot lease so a vanished client can't pin GC
 
 ## Usage
 
 ```bash
-cargo test --workspace      # unit + crash-recovery tests
+cargo test --workspace      # unit + crash-recovery + concurrency + HTTP API tests
+cargo run -p bedrock-server # start the HTTP server on 127.0.0.1:7878
 cargo bench --bench engine  # benchmarks (Criterion)
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
@@ -193,4 +233,4 @@ db.delete("key")?;
 ## Project layout
 
 - `crates/storage-engine` — the engine (library + a small demo binary)
-- `crates/server` — future network API (placeholder)
+- `crates/server` — the HTTP API: a `bedrock-server` binary over a hand-rolled HTTP/1.1 layer
