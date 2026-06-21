@@ -15,33 +15,49 @@ use std::path::{Path, PathBuf};
 
 pub struct Db {
     dir: std::path::PathBuf,
-    index: HashMap<String, ValueLoc>,
+    index: HashMap<String, Vec<Version>>,
     active_id: u64,
     active: fs::File,
     active_size: u64,
     readers: HashMap<u64, fs::File>,
     live: Vec<u64>, // segment ids currently live, in replay order (from the manifest)
     next_id: u64,   // next free segment id (monotonic, never reused)
+    next_seq: u64,
 }
 
 // Where a key's value lives in the log: byte offset of the value + its length.
+// Copy: small and pointer-like, so compaction can move it without cloning ceremony.
+#[derive(Clone, Copy)]
 struct ValueLoc {
     seg: u64,
     offset: u64,
     len: u32,
 }
 
-// Header bytes before the value: crc(4) + op(1) + key_len(4) + val_len(4).
-const HEADER_LEN: u64 = 13;
+// One versioned write of a key, stamped with the seq that produced it.
+struct Version {
+    seq: u64,
+    kind: VersionKind,
+}
+
+// A version is either a value at a location, or a tombstone (the key was deleted).
+enum VersionKind {
+    Set(ValueLoc),
+    Delete,
+}
+
+// Header bytes before the value: crc(4) + op(1) + seq(8) + key_len(4) + val_len(4).
+const HEADER_LEN: u64 = 21;
 const OP_SET: u8 = 0;
 const OP_DEL: u8 = 1;
 const SEGMENT_MAX: u64 = 64 * 1024;
 const COMPACT_AFTER: usize = 3; // compact once this many immutable segments pile up
 
-// Serialize one record: [crc u32][op u8][key_len u32][val_len u32][key][val], LE.
-fn encode_record(op: u8, key: &[u8], val: &[u8]) -> Vec<u8> {
+// Serialize one record: [crc u32][op u8][seq u64][key_len u32][val_len u32][key][val], LE.
+fn encode_record(op: u8, seq: u64, key: &[u8], val: &[u8]) -> Vec<u8> {
     let mut body = Vec::new();
     body.push(op);
+    body.extend_from_slice(&seq.to_le_bytes());
     body.extend_from_slice(&(key.len() as u32).to_le_bytes());
     body.extend_from_slice(&(val.len() as u32).to_le_bytes());
     body.extend_from_slice(key);
@@ -63,7 +79,8 @@ fn seg_path(dir: &Path, id: u64) -> PathBuf {
 fn replay_segment(
     file: &fs::File,
     seg: u64,
-    index: &mut HashMap<String, ValueLoc>,
+    index: &mut HashMap<String, Vec<Version>>,
+    max_seq: &mut u64,
 ) -> io::Result<u64> {
     let mut reader = BufReader::new(file);
     let mut offset: u64 = 0;
@@ -77,13 +94,14 @@ fn replay_segment(
         }
         let stored_checksum = u32::from_le_bytes(cksum_bytes);
 
-        let mut header = [0u8; 9];
+        let mut header = [0u8; 17];
         if reader.read_exact(&mut header).is_err() {
             break;
         }
         let op = header[0];
-        let key_len = u32::from_le_bytes(header[1..5].try_into().unwrap()) as usize;
-        let val_len = u32::from_le_bytes(header[5..9].try_into().unwrap()) as usize;
+        let seq = u64::from_le_bytes(header[1..9].try_into().unwrap());
+        let key_len = u32::from_le_bytes(header[9..13].try_into().unwrap()) as usize;
+        let val_len = u32::from_le_bytes(header[13..17].try_into().unwrap()) as usize;
 
         let mut payload = vec![0u8; key_len + val_len];
         if reader.read_exact(&mut payload).is_err() {
@@ -97,21 +115,25 @@ fn replay_segment(
             break; // torn / corrupted tail
         }
 
+        // Both SET and DEL consume a seq, so track the max over every valid record
+        // (not just surviving SETs) — a trailing DEL still advances next_seq.
+        *max_seq = (*max_seq).max(seq);
+
         let key = String::from_utf8(payload[..key_len].to_vec()).unwrap();
-        if op == OP_SET {
+        let kind = if op == OP_SET {
             let value_offset = offset + HEADER_LEN + key_len as u64;
-            index.insert(
-                key,
-                ValueLoc {
-                    seg,
-                    offset: value_offset,
-                    len: val_len as u32,
-                },
-            );
-        } else if op == OP_DEL {
-            index.remove(&key);
-        }
-        offset += 4 + 9 + key_len as u64 + val_len as u64;
+            VersionKind::Set(ValueLoc {
+                seg,
+                offset: value_offset,
+                len: val_len as u32,
+            })
+        } else {
+            VersionKind::Delete
+        };
+        // Append in file order: within a segment records are seq-ascending, and segments
+        // replay oldest-first, so each key's version list ends up sorted by seq.
+        index.entry(key).or_default().push(Version { seq, kind });
+        offset += HEADER_LEN + key_len as u64 + val_len as u64;
     }
 
     Ok(offset)
@@ -183,9 +205,10 @@ impl Db {
         let mut index = HashMap::new();
         let mut readers = HashMap::new();
         let mut active_end = 0u64;
+        let mut max_seq = 0u64;
         for &id in &live {
             let r = OpenOptions::new().read(true).open(seg_path(&dir, id))?;
-            active_end = replay_segment(&r, id, &mut index)?;
+            active_end = replay_segment(&r, id, &mut index, &mut max_seq)?;
             readers.insert(id, r);
         }
 
@@ -220,45 +243,66 @@ impl Db {
             readers,
             live,
             next_id: max_seen + 1,
+            next_seq: max_seq + 1,
         })
     }
 
     pub fn set(&mut self, key: String, value: String) -> io::Result<()> {
-        let rec = encode_record(OP_SET, key.as_bytes(), value.as_bytes());
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        let rec = encode_record(OP_SET, seq, key.as_bytes(), value.as_bytes());
         let (seg, record_start) = self.append(&rec)?;
 
         let value_offset = record_start + HEADER_LEN + key.len() as u64;
-        self.index.insert(
-            key,
-            ValueLoc {
-                seg,
-                offset: value_offset,
-                len: value.len() as u32,
-            },
-        );
+        let loc = ValueLoc {
+            seg,
+            offset: value_offset,
+            len: value.len() as u32,
+        };
+        // Append a new version instead of overwriting: older versions stay reachable for
+        // snapshots, and the newest (last()) is what get returns.
+        self.index.entry(key).or_default().push(Version {
+            seq,
+            kind: VersionKind::Set(loc),
+        });
         self.maybe_compact()
     }
 
     pub fn get(&self, key: &str) -> io::Result<Option<String>> {
-        let loc = match self.index.get(key) {
-            Some(loc) => loc,
-            None => return Ok(None),
-        };
+        match self.index.get(key).and_then(|versions| versions.last()) {
+            Some(Version {
+                kind: VersionKind::Set(loc),
+                ..
+            }) => Ok(Some(self.read_value(loc)?)),
+            // No versions at all, or the newest one is a tombstone -> key is absent.
+            _ => Ok(None),
+        }
+    }
 
-        // Read exactly the value's bytes straight from its offset. Positioned I/O
-        // (`pread`) moves no shared file cursor, so concurrent reads on the same
-        // segment handle don't corrupt each other — no lock needed for reads.
+    // Read a value's bytes straight from its on-disk location. Positioned I/O (`pread`)
+    // moves no shared file cursor, so concurrent reads on the same segment handle don't
+    // corrupt each other — no lock needed for reads.
+    fn read_value(&self, loc: &ValueLoc) -> io::Result<String> {
         let r = &self.readers[&loc.seg];
         let mut buf = vec![0u8; loc.len as usize];
         r.read_exact_at(&mut buf, loc.offset)?;
-
-        Ok(Some(String::from_utf8(buf).unwrap()))
+        Ok(String::from_utf8(buf).unwrap())
     }
 
     pub fn delete(&mut self, key: &str) -> io::Result<()> {
-        let rec = encode_record(OP_DEL, key.as_bytes(), &[]);
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        let rec = encode_record(OP_DEL, seq, key.as_bytes(), &[]);
         self.append(&rec)?;
-        self.index.remove(key);
+        // A delete is a versioned tombstone, not a removal: a snapshot taken before it
+        // must still see the prior value, so the key's history is preserved.
+        self.index
+            .entry(key.to_string())
+            .or_default()
+            .push(Version {
+                seq,
+                kind: VersionKind::Delete,
+            });
         self.maybe_compact()
     }
 
@@ -337,29 +381,44 @@ impl Db {
             .append(true)
             .open(&comp_path)?;
 
-        let keys: Vec<String> = self
-            .index
-            .iter()
-            .filter(|(_, loc)| immutable.contains(&loc.seg))
-            .map(|(k, _)| k.clone())
-            .collect();
-
-        let mut new_locs = Vec::with_capacity(keys.len());
+        // No live snapshots yet (8b.4 adds them), so keep only the LATEST version of each
+        // key. Newest value in an immutable segment -> rewrite into the compacted segment;
+        // newest already in the active segment -> keep as-is; newest is a tombstone -> drop
+        // the key. Rebuilding a fresh index also prunes versions that pointed into the
+        // segments we're about to delete.
+        let mut new_index: HashMap<String, Vec<Version>> = HashMap::new();
         let mut offset = 0u64;
-        for key in keys {
-            let value = self.get(&key)?.expect("indexed key must have a value");
-            let rec = encode_record(OP_SET, key.as_bytes(), value.as_bytes());
-            comp.write_all(&rec)?;
-            let value_offset = offset + HEADER_LEN + key.len() as u64;
-            new_locs.push((
-                key,
+        for (key, versions) in &self.index {
+            let (seq, loc) = match versions.last() {
+                Some(Version {
+                    seq,
+                    kind: VersionKind::Set(loc),
+                }) => (*seq, *loc),
+                _ => continue, // empty history or latest is a tombstone -> drop the key
+            };
+
+            let new_loc = if immutable.contains(&loc.seg) {
+                let value = self.read_value(&loc)?;
+                let rec = encode_record(OP_SET, seq, key.as_bytes(), value.as_bytes());
+                comp.write_all(&rec)?;
+                let value_offset = offset + HEADER_LEN + key.len() as u64;
+                offset += rec.len() as u64;
                 ValueLoc {
                     seg: comp_id,
                     offset: value_offset,
                     len: value.len() as u32,
-                },
-            ));
-            offset += rec.len() as u64;
+                }
+            } else {
+                loc // latest already lives in the surviving active segment
+            };
+
+            new_index.insert(
+                key.clone(),
+                vec![Version {
+                    seq,
+                    kind: VersionKind::Set(new_loc),
+                }],
+            );
         }
         comp.sync_all()?;
 
@@ -370,9 +429,7 @@ impl Db {
         // Commit in memory and drop the old segments.
         self.readers
             .insert(comp_id, OpenOptions::new().read(true).open(&comp_path)?);
-        for (key, loc) in new_locs {
-            self.index.insert(key, loc);
-        }
+        self.index = new_index;
         for id in &immutable {
             self.readers.remove(id);
             let _ = fs::remove_file(seg_path(&self.dir, *id));
@@ -400,11 +457,17 @@ impl Db {
         let mut index: Vec<IndexEntry> = self
             .index
             .iter()
-            .map(|(k, loc)| IndexEntry {
-                key: k.clone(),
-                seg: loc.seg,
-                offset: loc.offset,
-                len: loc.len,
+            .filter_map(|(k, versions)| match versions.last() {
+                Some(Version {
+                    kind: VersionKind::Set(loc),
+                    ..
+                }) => Some(IndexEntry {
+                    key: k.clone(),
+                    seg: loc.seg,
+                    offset: loc.offset,
+                    len: loc.len,
+                }),
+                _ => None,
             })
             .collect();
         index.sort_by(|a, b| a.key.cmp(&b.key));

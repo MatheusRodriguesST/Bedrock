@@ -72,9 +72,13 @@ ou MVCC para isolamento de transações.
   como `Arc<RwLock<Db>>` (N leitores XOR 1 escritor), lock grosso **no chamador** (os métodos
   seguem `&self`/`&mut self`). Teste `tests/concurrency.rs` (1 writer + 8 readers) é o
   entregável — quebra se o cursor voltar (regressão real do `seek`+`read`).
-- ⏭️ PRÓXIMO (degrau 8b): **MVCC** — `seq` por registro (bump de formato), índice por versão,
-  snapshot do leitor filtra por `seq <= snapshot`, GC respeitando o menor snapshot vivo.
-  Ver [[07-concorrencia-mvcc]] (spec 8b).
+- ⏭️ EM ANDAMENTO (degrau 8b): **MVCC** — `seq` por registro (bump de formato), índice por
+  versão, snapshot do leitor filtra por `seq <= snapshot`, GC respeitando o menor snapshot vivo.
+  Spec detalhada e sub-passos em [[09-mvcc-snapshot-isolation]]. Começando pelo 8b.1 (formato v2).
+- ⏭️ AGENDADO (degrau 8c, **logo após o 8b.4**): **leituras lock-free** — mover a sincronização
+  pra dentro do `Db` (`Db: Clone` sobre `Arc<Inner>`), encurtar a seção crítica do `get` (I/O
+  fora do lock) e/ou índice imutável com swap atômico → "leitor nunca bloqueia escritor". É o
+  refinamento que o 8a/8b deixaram de fora de propósito ("começar grosso, medir, refinar").
 - 🧭 GARANTIA ATUAL: durabilidade a **crash** (assumindo que o disco honra o fsync) +
   concorrência por `RwLock` grosso (escritor/compaction bloqueia todas as leituras; sem
   snapshot isolation entre operações ainda). Números: `set` ~2,6 ms (vs SQLite ~2,8 ms),
@@ -89,7 +93,7 @@ ou MVCC para isolamento de transações.
    replay tolera registro rasgado (torn write)
 6. **[FEITO]** Índice de offsets (guarda chave→posição, não o valor) → estilo Bitcask completo
 7. **[FEITO]** Segmentos + compaction (manifesto crash-safe) → base do LSM-tree
-8. Concorrência: **8a [FEITO]** lock (`RwLock`, leituras concorrentes) → **8b [PRÓXIMO]** MVCC (sequence numbers, snapshot isolation)
+8. Concorrência: **8a [FEITO]** lock (`RwLock`) → **8b [EM ANDAMENTO]** MVCC (snapshot isolation) → **8c [LOGO APÓS 8b.4]** leituras lock-free (sync dentro do `Db`, I/O fora da seção crítica)
 9. API HTTP / linguagem de query mínima
 
 ## Garantias a documentar no README final
