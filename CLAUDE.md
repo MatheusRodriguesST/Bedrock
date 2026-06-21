@@ -67,10 +67,18 @@ ou MVCC para isolamento de transações.
   dos segmentos vivos; compaction síncrona por tamanho mescla imutáveis, swap **atômico** do
   manifesto (crash-safe), órfãos limpos no `open`. + truncate-on-recovery. `debug_status`
   (introspecção read-only) pro observer em `playground/observer`.
-- ⏭️ PRÓXIMO (degrau 8): concorrência — `RwLock` para leituras concorrentes, depois **MVCC**
-  (sequence numbers + snapshot isolation). Ver [[07-concorrencia-mvcc]] nas notas.
-- 🧭 GARANTIA ATUAL: durabilidade a **crash** (assumindo que o disco honra o fsync).
-  Números: `set` ~2,6 ms (vs SQLite ~2,8 ms), `get` ~0,77 µs (vs SQLite ~2,15 µs).
+- ✅ FEITO (degrau 8a): **leituras concorrentes**. `get` usa `read_exact_at` (positioned I/O,
+  sem cursor compartilhado) → leituras thread-safe sem lock. `Db` é `Send + Sync`; compartilha
+  como `Arc<RwLock<Db>>` (N leitores XOR 1 escritor), lock grosso **no chamador** (os métodos
+  seguem `&self`/`&mut self`). Teste `tests/concurrency.rs` (1 writer + 8 readers) é o
+  entregável — quebra se o cursor voltar (regressão real do `seek`+`read`).
+- ⏭️ PRÓXIMO (degrau 8b): **MVCC** — `seq` por registro (bump de formato), índice por versão,
+  snapshot do leitor filtra por `seq <= snapshot`, GC respeitando o menor snapshot vivo.
+  Ver [[07-concorrencia-mvcc]] (spec 8b).
+- 🧭 GARANTIA ATUAL: durabilidade a **crash** (assumindo que o disco honra o fsync) +
+  concorrência por `RwLock` grosso (escritor/compaction bloqueia todas as leituras; sem
+  snapshot isolation entre operações ainda). Números: `set` ~2,6 ms (vs SQLite ~2,8 ms),
+  `get` ~0,77 µs (vs SQLite ~2,15 µs).
 
 ## Roadmap em degraus (cada um resolve a limitação do anterior)
 1. **[FEITO]** `struct Db` + `open` (abre/cria o log, índice em memória)
@@ -81,7 +89,7 @@ ou MVCC para isolamento de transações.
    replay tolera registro rasgado (torn write)
 6. **[FEITO]** Índice de offsets (guarda chave→posição, não o valor) → estilo Bitcask completo
 7. **[FEITO]** Segmentos + compaction (manifesto crash-safe) → base do LSM-tree
-8. **[PRÓXIMO]** Concorrência: lock (`RwLock`) → depois MVCC (sequence numbers, snapshot isolation)
+8. Concorrência: **8a [FEITO]** lock (`RwLock`, leituras concorrentes) → **8b [PRÓXIMO]** MVCC (sequence numbers, snapshot isolation)
 9. API HTTP / linguagem de query mínima
 
 ## Garantias a documentar no README final

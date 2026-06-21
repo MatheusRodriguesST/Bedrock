@@ -1,14 +1,16 @@
 //! Bedrock — an append-only key/value storage engine with an in-memory index
 //! (Bitcask-style). Writes append a length-prefixed, CRC32-checked record to the
 //! active segment and fsync it; data lives in a directory of segment files, and the
-//! index maps each key to its value's location (segment, offset, length).
-//! See README.md for the on-disk format and durability guarantees.
+//! index maps each key to its value's location (segment, offset, length). Reads are
+//! positioned (`pread`/`read_at`), so they never move a shared file cursor and are
+//! safe to run from many threads at once. See README.md for the on-disk format and
+//! durability guarantees.
 
 use std::collections::HashMap;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::{self, BufReader, Read, Write};
-use std::io::{Seek, SeekFrom};
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
 pub struct Db {
@@ -243,11 +245,12 @@ impl Db {
             None => return Ok(None),
         };
 
-        // Seek to the value's offset and read exactly its bytes from disk.
-        let mut r = &self.readers[&loc.seg];
-        r.seek(SeekFrom::Start(loc.offset))?;
+        // Read exactly the value's bytes straight from its offset. Positioned I/O
+        // (`pread`) moves no shared file cursor, so concurrent reads on the same
+        // segment handle don't corrupt each other — no lock needed for reads.
+        let r = &self.readers[&loc.seg];
         let mut buf = vec![0u8; loc.len as usize];
-        r.read_exact(&mut buf)?;
+        r.read_exact_at(&mut buf, loc.offset)?;
 
         Ok(Some(String::from_utf8(buf).unwrap()))
     }

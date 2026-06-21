@@ -25,7 +25,7 @@ documented below — that is the point of the project as much as the code.
 | **Durability** | An acknowledged write survives a process **and** machine crash (power loss / kernel panic), assuming the disk honors the flush. Every write is `fsync`'d before `set`/`delete` returns. |
 | **Crash recovery** | A write torn in half by a crash is detected via a per-record CRC32 and discarded on replay; all complete records before it are preserved. Proven by an automated SIGKILL test. |
 | **Atomicity** | A single `set`/`delete` is the unit of atomicity (one record). Multi-key transactions are not supported yet. |
-| **Isolation** | Single-writer, single-process. Concurrent access control (locking / MVCC) is on the roadmap, not implemented. |
+| **Isolation** | Reads touch no shared file cursor (positioned `pread`), so the engine is `Send + Sync` and safe to share as `Arc<RwLock<Db>>`: **many concurrent readers xor one exclusive writer**. The lock is coarse — a writer (including compaction) blocks all readers while it runs. No snapshot isolation across operations yet; MVCC is the next step. |
 
 ## Architecture
 
@@ -37,7 +37,8 @@ ch. 3, "Hash Indexes"):
 - **In-memory index.** A hash map maps each key to the **on-disk location** of its
   value (`offset + length`) — not the value itself. RAM usage scales with the *number
   of keys*, not the total size of the values, so the dataset can exceed RAM. Reads do
-  one `seek + read`; the OS page cache absorbs the cost of hot keys.
+  one positioned read (`pread` / `read_at`) — no shared file cursor, so concurrent
+  readers don't interfere; the OS page cache absorbs the cost of hot keys.
 - **Segments + compaction.** The log is split into fixed-size segment files; the active
   one rolls over when it fills. A size-triggered **compaction** merges the immutable
   segments into one, keeping only the latest value per key, which reclaims the space held
