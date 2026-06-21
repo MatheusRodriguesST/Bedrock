@@ -898,6 +898,78 @@ mod tests {
         let _ = fs::remove_dir_all(p);
     }
 
+    // The hardest GC branch: a tombstone ABOVE the floor, living in an immutable segment,
+    // must be rewritten into the compacted segment (carrying its original seq) and survive
+    // a reopen. If it were lost, a snapshot at the delete's seq would wrongly resolve the
+    // key to its pre-delete value instead of seeing it deleted.
+    #[test]
+    fn gc_preserves_a_tombstone_above_the_floor() {
+        let path = temp_dir("gc-tombstone");
+        let p = path.to_str().unwrap();
+        let big = "w".repeat(2000);
+
+        let snap_seq;
+        let del_seq;
+        {
+            let mut db = Db::open(p).unwrap();
+            db.set("k".to_string(), "v0".to_string()).unwrap(); // seq 1
+            let snap = db.snapshot(); // frozen at v0 -> min_live pins the floor at seq 1
+            snap_seq = snap.seq;
+
+            del_seq = db.next_seq;
+            db.delete("k").unwrap(); // tombstone ABOVE the floor
+
+            // Overwrite enough to roll v0 + the tombstone into immutable segments and fire
+            // compaction while the snapshot is alive (so both are kept and rewritten).
+            for i in 0..60 {
+                db.set("k".to_string(), format!("{big}-v{i}")).unwrap();
+            }
+            assert_eq!(db.get_as_of("k", snap_seq).unwrap().as_deref(), Some("v0"));
+            assert_eq!(db.get_as_of("k", del_seq).unwrap(), None);
+            drop(snap);
+        }
+
+        // Reopen: the rewritten tombstone must replay from the compacted segment (its
+        // original immutable segment was deleted by compaction).
+        let db = Db::open(p).unwrap();
+        assert_eq!(db.get_as_of("k", snap_seq).unwrap().as_deref(), Some("v0"));
+        assert_eq!(db.get_as_of("k", del_seq).unwrap(), None); // tombstone survived
+        assert_eq!(db.get("k").unwrap(), Some(format!("{big}-v59")));
+
+        let _ = fs::remove_dir_all(p);
+    }
+
+    // With no live snapshot, a set followed by a delete must be reclaimed entirely by
+    // compaction: the floor is the tombstone with nothing above it, so the key is dropped
+    // from the index rather than lingering as a dead tombstone forever.
+    #[test]
+    fn gc_reclaims_a_fully_deleted_key() {
+        let path = temp_dir("gc-reclaim");
+        let p = path.to_str().unwrap();
+        let mut db = Db::open(p).unwrap();
+        let big = "w".repeat(2000);
+
+        // Pad to roll segments, set+delete k, then pad again so k's tombstone lands in an
+        // immutable segment that compaction will process.
+        for i in 0..30 {
+            db.set(format!("pad-{i}"), big.clone()).unwrap();
+        }
+        db.set("k".to_string(), "v".to_string()).unwrap();
+        db.delete("k").unwrap();
+        for i in 30..90 {
+            db.set(format!("pad-{i}"), big.clone()).unwrap();
+        }
+        db.compact().unwrap();
+
+        assert_eq!(db.get("k").unwrap(), None);
+        assert!(
+            !db.index.contains_key("k"),
+            "fully-deleted key should be GC'd out of the index"
+        );
+
+        let _ = fs::remove_dir_all(p);
+    }
+
     // Dropping a snapshot must release its refcount; the registry entry disappears once
     // the last holder is gone. This is what keeps min_live correct for the GC (8b.4).
     #[test]
