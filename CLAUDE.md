@@ -74,7 +74,15 @@ ou MVCC para isolamento de transações.
   entregável — quebra se o cursor voltar (regressão real do `seek`+`read`).
 - ⏭️ EM ANDAMENTO (degrau 8b): **MVCC** — `seq` por registro (bump de formato), índice por
   versão, snapshot do leitor filtra por `seq <= snapshot`, GC respeitando o menor snapshot vivo.
-  Spec detalhada e sub-passos em [[09-mvcc-snapshot-isolation]]. Começando pelo 8b.1 (formato v2).
+  Spec detalhada e sub-passos em [[09-mvcc-snapshot-isolation]].
+  - ✅ 8b.1 (formato v2 com `seq` no corpo coberto pelo CRC, `next_seq` reconstruído no replay).
+  - ✅ 8b.2 (índice multi-versão `HashMap<String, Vec<Version>>`; `delete` é tombstone versionado).
+  - ✅ 8b.3 (**leitura por snapshot**): registry `Arc<Mutex<BTreeMap<seq,refcount>>>` **fora** do
+    `RwLock` (evita deadlock no `Drop`); token `Snapshot { seq, registry }` com `Drop` que libera
+    o refcount; `snapshot()` congela `next_seq-1`; `get_as_of(key, snap)` = maior versão com
+    `seq <= snap`; `get` virou `get_as_of(key, next_seq-1)`. 3 testes novos (10 unit no total).
+  - ⏭️ FALTA 8b.4 (**GC**): `compact` respeita `min_live` (menor `seq` com refcount>0; vazio →
+    `next_seq-1`), preservando o `seq` original das versões mantidas.
 - ⏭️ AGENDADO (degrau 8c, **logo após o 8b.4**): **leituras lock-free** — mover a sincronização
   pra dentro do `Db` (`Db: Clone` sobre `Arc<Inner>`), encurtar a seção crítica do `get` (I/O
   fora do lock) e/ou índice imutável com swap atômico → "leitor nunca bloqueia escritor". É o

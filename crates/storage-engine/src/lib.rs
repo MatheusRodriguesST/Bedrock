@@ -6,12 +6,13 @@
 //! safe to run from many threads at once. See README.md for the on-disk format and
 //! durability guarantees.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::{self, BufReader, Read, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 pub struct Db {
     dir: std::path::PathBuf,
@@ -23,9 +24,9 @@ pub struct Db {
     live: Vec<u64>, // segment ids currently live, in replay order (from the manifest)
     next_id: u64,   // next free segment id (monotonic, never reused)
     next_seq: u64,
+    snapshots: Arc<Mutex<BTreeMap<u64, u32>>>,
 }
 
-// Where a key's value lives in the log: byte offset of the value + its length.
 // Copy: small and pointer-like, so compaction can move it without cloning ceremony.
 #[derive(Clone, Copy)]
 struct ValueLoc {
@@ -34,16 +35,46 @@ struct ValueLoc {
     len: u32,
 }
 
-// One versioned write of a key, stamped with the seq that produced it.
+/// A consistent point-in-time view of the database, identified by the `seq` that was
+/// current when it was taken. Reads through `get_as_of(key, snap.seq)` only ever see
+/// versions with `seq <= snap.seq`, so later writes are invisible to the holder no
+/// matter how long it lives (snapshot isolation, DDIA ch. 7).
+///
+/// The token is intentionally lightweight: it owns its `seq` and a clone of the live-
+/// snapshot registry, but holds *no* reference to the `Db` and *no* lock. That lets it
+/// outlive the short `db.read()` guard used to create it. While it is alive it keeps a
+/// refcount on its `seq` in the registry, which the GC (compaction) consults so it never
+/// reclaims a version this snapshot can still reach.
+pub struct Snapshot {
+    pub seq: u64,
+    registry: Arc<Mutex<BTreeMap<u64, u32>>>,
+}
+
+impl Drop for Snapshot {
+    fn drop(&mut self) {
+        // Locks only this small mutex, never the big Db lock — that's why the registry
+        // lives outside the RwLock: dropping a snapshot mid-write can't deadlock.
+        // `if let Ok` over `unwrap`: panicking inside Drop during another panic aborts.
+        if let Ok(mut reg) = self.registry.lock() {
+            if let Some(count) = reg.get_mut(&self.seq) {
+                *count -= 1;
+                // Remove at zero so `min_live` reflects only genuinely live snapshots.
+                if *count == 0 {
+                    reg.remove(&self.seq);
+                }
+            }
+        }
+    }
+}
+
 struct Version {
     seq: u64,
     kind: VersionKind,
 }
 
-// A version is either a value at a location, or a tombstone (the key was deleted).
 enum VersionKind {
     Set(ValueLoc),
-    Delete,
+    Delete, // tombstone: the key was deleted at this seq
 }
 
 // Header bytes before the value: crc(4) + op(1) + seq(8) + key_len(4) + val_len(4).
@@ -244,6 +275,7 @@ impl Db {
             live,
             next_id: max_seen + 1,
             next_seq: max_seq + 1,
+            snapshots: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
 
@@ -268,13 +300,45 @@ impl Db {
         self.maybe_compact()
     }
 
+    /// Take a snapshot: freeze the current logical clock so later reads can ask for the
+    /// database "as of now" even after more writes land. Returns a lightweight token.
+    ///
+    /// `&self` is enough even though we mutate the registry: the registry is a `Mutex`
+    /// (interior mutability), and the caller invokes this under `db.read()`, so no writer
+    /// is bumping `next_seq` concurrently — reading `next_seq - 1` is a consistent point.
+    /// The seq is the last *committed* write (next_seq points at the next, unused one).
+    pub fn snapshot(&self) -> Snapshot {
+        let seq = self.next_seq - 1;
+        // u32 refcount, not a bool: several readers may snapshot the same seq at once.
+        *self.snapshots.lock().unwrap().entry(seq).or_insert(0) += 1;
+        Snapshot {
+            seq,
+            registry: Arc::clone(&self.snapshots),
+        }
+    }
+
     pub fn get(&self, key: &str) -> io::Result<Option<String>> {
-        match self.index.get(key).and_then(|versions| versions.last()) {
+        // Reading "now" is just reading as of the latest committed seq.
+        self.get_as_of(key, self.next_seq - 1)
+    }
+
+    /// Read a key as it existed at logical time `snap`: the value of the version with the
+    /// greatest `seq <= snap`. This is the heart of MVCC (DDIA ch. 7, "Snapshot
+    /// Isolation"). Versions with `seq > snap` are from the reader's future and ignored.
+    pub fn get_as_of(&self, key: &str, snap: u64) -> io::Result<Option<String>> {
+        // The version list is ascending by seq, so scanning from the back and taking the
+        // first one within the snapshot gives the greatest seq <= snap in one pass.
+        let visible = self
+            .index
+            .get(key)
+            .and_then(|versions| versions.iter().rev().find(|v| v.seq <= snap));
+
+        match visible {
             Some(Version {
                 kind: VersionKind::Set(loc),
                 ..
             }) => Ok(Some(self.read_value(loc)?)),
-            // No versions at all, or the newest one is a tombstone -> key is absent.
+            // Tombstone at/before snap, or nothing visible (key first written after snap).
             _ => Ok(None),
         }
     }
@@ -372,8 +436,6 @@ impl Db {
             return Ok(());
         }
 
-        // Write the latest value of every key that currently lives in an immutable
-        // segment into one new compacted segment.
         let comp_id = self.next_id;
         let comp_path = seg_path(&self.dir, comp_id);
         let mut comp = OpenOptions::new()
@@ -719,6 +781,70 @@ mod tests {
             !path.join("009999.seg").exists(),
             "orphan segment should be deleted on open"
         );
+
+        let _ = fs::remove_dir_all(p);
+    }
+
+    // The MVCC deliverable: a snapshot is frozen at the seq it was taken. Later writes —
+    // even a delete — are invisible to it, while the present sees them. This is the
+    // analogue of "revert to seek and watch it break": it proves old versions stay
+    // reachable through a snapshot taken before them.
+    #[test]
+    fn snapshot_sees_a_frozen_point_in_time() {
+        let path = temp_dir("snapshot-mvcc");
+        let p = path.to_str().unwrap();
+        let mut db = Db::open(p).unwrap();
+
+        db.set("k".to_string(), "v0".to_string()).unwrap();
+        let s = db.snapshot(); // frozen at the seq of k=v0
+
+        db.set("k".to_string(), "v1".to_string()).unwrap();
+        db.delete("k").unwrap();
+
+        // The snapshot never moves: it still resolves k to the value it saw.
+        assert_eq!(db.get_as_of("k", s.seq).unwrap().as_deref(), Some("v0"));
+        // The present sees the latest write (the delete) -> key is gone.
+        assert_eq!(db.get("k").unwrap(), None);
+
+        let _ = fs::remove_dir_all(p);
+    }
+
+    // A snapshot taken before a key's first write must not see it: no version satisfies
+    // seq <= snap, so the lookup yields None rather than leaking a future value.
+    #[test]
+    fn snapshot_predating_a_key_does_not_see_it() {
+        let path = temp_dir("snapshot-predate");
+        let p = path.to_str().unwrap();
+        let mut db = Db::open(p).unwrap();
+
+        let s = db.snapshot(); // empty db -> seq 0
+        db.set("late".to_string(), "value".to_string()).unwrap();
+
+        assert_eq!(db.get_as_of("late", s.seq).unwrap(), None);
+        assert_eq!(db.get("late").unwrap().as_deref(), Some("value"));
+
+        let _ = fs::remove_dir_all(p);
+    }
+
+    // Dropping a snapshot must release its refcount; the registry entry disappears once
+    // the last holder is gone. This is what keeps min_live correct for the GC (8b.4).
+    #[test]
+    fn dropping_a_snapshot_releases_its_refcount() {
+        let path = temp_dir("snapshot-refcount");
+        let p = path.to_str().unwrap();
+        let mut db = Db::open(p).unwrap();
+        db.set("k".to_string(), "v".to_string()).unwrap();
+
+        let s1 = db.snapshot();
+        let s2 = db.snapshot(); // same seq -> refcount should be 2, one entry
+        assert_eq!(db.snapshots.lock().unwrap().get(&s1.seq), Some(&2));
+
+        drop(s2);
+        assert_eq!(db.snapshots.lock().unwrap().get(&s1.seq), Some(&1));
+
+        drop(s1);
+        // Last holder gone -> the entry is removed entirely, not left at 0.
+        assert!(db.snapshots.lock().unwrap().is_empty());
 
         let _ = fs::remove_dir_all(p);
     }
