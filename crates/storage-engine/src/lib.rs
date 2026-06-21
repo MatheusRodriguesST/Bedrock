@@ -74,7 +74,9 @@ struct Version {
 
 enum VersionKind {
     Set(ValueLoc),
-    Delete, // tombstone: the key was deleted at this seq
+    // Tombstone. The u64 is the segment its DEL record lives in, so compaction can tell
+    // whether a kept tombstone must be rewritten (its segment is being dropped) or not.
+    Delete(u64),
 }
 
 // Header bytes before the value: crc(4) + op(1) + seq(8) + key_len(4) + val_len(4).
@@ -159,7 +161,7 @@ fn replay_segment(
                 len: val_len as u32,
             })
         } else {
-            VersionKind::Delete
+            VersionKind::Delete(seg)
         };
         // Append in file order: within a segment records are seq-ascending, and segments
         // replay oldest-first, so each key's version list ends up sorted by seq.
@@ -206,6 +208,20 @@ fn write_manifest(dir: &Path, live: &[u64]) -> io::Result<()> {
     fs::rename(&tmp, manifest_path(dir))?;
     let _ = fs::File::open(dir).and_then(|f| f.sync_all());
     Ok(())
+}
+
+// The versions a GC pass must keep for one key, given the oldest live snapshot
+// (`min_live`): the "floor" (greatest version with seq <= min_live, which the oldest
+// reader resolves to) plus every version above it (any live snapshot can stop on one).
+// Everything below the floor is unreachable by any live snapshot, so it can be dropped.
+// `versions` is ascending by seq, so the floor is the last index with seq <= min_live and
+// the kept slice is [floor..]. No version <= min_live means the key was first written
+// after the oldest snapshot, so all versions are above the floor and all are kept.
+fn versions_to_keep(versions: &[Version], min_live: u64) -> &[Version] {
+    match versions.iter().rposition(|v| v.seq <= min_live) {
+        Some(floor) => &versions[floor..],
+        None => versions,
+    }
 }
 
 impl Db {
@@ -357,7 +373,7 @@ impl Db {
         let seq = self.next_seq;
         self.next_seq += 1;
         let rec = encode_record(OP_DEL, seq, key.as_bytes(), &[]);
-        self.append(&rec)?;
+        let (seg, _) = self.append(&rec)?;
         // A delete is a versioned tombstone, not a removal: a snapshot taken before it
         // must still see the prior value, so the key's history is preserved.
         self.index
@@ -365,7 +381,7 @@ impl Db {
             .or_default()
             .push(Version {
                 seq,
-                kind: VersionKind::Delete,
+                kind: VersionKind::Delete(seg),
             });
         self.maybe_compact()
     }
@@ -418,9 +434,12 @@ impl Db {
         Ok(())
     }
 
-    /// Merge every immutable segment (all but the active) into one fresh segment,
-    /// keeping only the latest value per key, then atomically swap the manifest and
-    /// drop the old segments.
+    /// Merge every immutable segment (all but the active) into one fresh segment, then
+    /// atomically swap the manifest and drop the old segments.
+    ///
+    /// This is also the GC: per key it keeps only the versions a live snapshot can still
+    /// reach (`versions_to_keep` against the oldest live snapshot) and discards the rest.
+    /// With no snapshots live, that collapses to the single latest version per key.
     ///
     /// Crash-safe via the manifest: a crash before the swap leaves the old set live
     /// (the new segment is an ignored orphan); a crash after leaves the new set live
@@ -443,44 +462,62 @@ impl Db {
             .append(true)
             .open(&comp_path)?;
 
-        // No live snapshots yet (8b.4 adds them), so keep only the LATEST version of each
-        // key. Newest value in an immutable segment -> rewrite into the compacted segment;
-        // newest already in the active segment -> keep as-is; newest is a tombstone -> drop
-        // the key. Rebuilding a fresh index also prunes versions that pointed into the
-        // segments we're about to delete.
+        // The oldest live snapshot decides what survives. No live snapshots -> the latest
+        // committed seq, which makes versions_to_keep collapse to one version per key.
+        let min_live = match self.snapshots.lock().unwrap().keys().next() {
+            Some(&oldest) => oldest,
+            None => self.next_seq - 1,
+        };
+
+        // Rebuild a fresh index from the kept versions. A version in an immutable segment
+        // (about to be deleted) is rewritten into the compacted segment preserving its
+        // ORIGINAL seq — the seq is the version's identity in time, so a snapshot must keep
+        // resolving to it. A version already in the surviving active segment is kept as-is.
         let mut new_index: HashMap<String, Vec<Version>> = HashMap::new();
         let mut offset = 0u64;
         for (key, versions) in &self.index {
-            let (seq, loc) = match versions.last() {
-                Some(Version {
-                    seq,
-                    kind: VersionKind::Set(loc),
-                }) => (*seq, *loc),
-                _ => continue, // empty history or latest is a tombstone -> drop the key
-            };
+            let mut keep = versions_to_keep(versions, min_live);
+            // A floor tombstone is reclaimable: nothing older survives, so its absence
+            // reads as None just like the tombstone would. (Tombstones ABOVE the floor are
+            // not in `keep`'s first slot and are preserved below.)
+            if matches!(keep.first().map(|v| &v.kind), Some(VersionKind::Delete(_))) {
+                keep = &keep[1..];
+            }
+            if keep.is_empty() {
+                continue;
+            }
 
-            let new_loc = if immutable.contains(&loc.seg) {
-                let value = self.read_value(&loc)?;
-                let rec = encode_record(OP_SET, seq, key.as_bytes(), value.as_bytes());
-                comp.write_all(&rec)?;
-                let value_offset = offset + HEADER_LEN + key.len() as u64;
-                offset += rec.len() as u64;
-                ValueLoc {
-                    seg: comp_id,
-                    offset: value_offset,
-                    len: value.len() as u32,
-                }
-            } else {
-                loc // latest already lives in the surviving active segment
-            };
-
-            new_index.insert(
-                key.clone(),
-                vec![Version {
-                    seq,
-                    kind: VersionKind::Set(new_loc),
-                }],
-            );
+            let mut kept_versions = Vec::with_capacity(keep.len());
+            for v in keep {
+                let new_kind = match &v.kind {
+                    VersionKind::Set(loc) if immutable.contains(&loc.seg) => {
+                        let value = self.read_value(loc)?;
+                        let rec = encode_record(OP_SET, v.seq, key.as_bytes(), value.as_bytes());
+                        comp.write_all(&rec)?;
+                        let value_offset = offset + HEADER_LEN + key.len() as u64;
+                        offset += rec.len() as u64;
+                        VersionKind::Set(ValueLoc {
+                            seg: comp_id,
+                            offset: value_offset,
+                            len: value.len() as u32,
+                        })
+                    }
+                    VersionKind::Delete(seg) if immutable.contains(seg) => {
+                        let rec = encode_record(OP_DEL, v.seq, key.as_bytes(), &[]);
+                        comp.write_all(&rec)?;
+                        offset += rec.len() as u64;
+                        VersionKind::Delete(comp_id)
+                    }
+                    // Already in the surviving active segment -> keep the location as-is.
+                    VersionKind::Set(loc) => VersionKind::Set(*loc),
+                    VersionKind::Delete(seg) => VersionKind::Delete(*seg),
+                };
+                kept_versions.push(Version {
+                    seq: v.seq,
+                    kind: new_kind,
+                });
+            }
+            new_index.insert(key.clone(), kept_versions);
         }
         comp.sync_all()?;
 
@@ -822,6 +859,41 @@ mod tests {
 
         assert_eq!(db.get_as_of("late", s.seq).unwrap(), None);
         assert_eq!(db.get("late").unwrap().as_deref(), Some("value"));
+
+        let _ = fs::remove_dir_all(p);
+    }
+
+    // 8b.4 GC: a version a live snapshot can still reach must survive compaction; once the
+    // snapshot is dropped, that version becomes collectable and the pile collapses. The two
+    // directions together prove the rule protects what's live and frees what's dead.
+    #[test]
+    fn gc_preserves_versions_a_live_snapshot_needs() {
+        let path = temp_dir("gc-snapshot");
+        let p = path.to_str().unwrap();
+        let mut db = Db::open(p).unwrap();
+
+        db.set("k".to_string(), "v0".to_string()).unwrap();
+        let snap = db.snapshot(); // frozen at v0
+        let snap_seq = snap.seq;
+
+        // Overwrite k many times with big values to roll segments and trigger compaction
+        // while the snapshot is alive (min_live = snap_seq, so v0's floor is protected).
+        let big = "z".repeat(2000);
+        for i in 1..=60 {
+            db.set("k".to_string(), format!("{big}-v{i}")).unwrap();
+        }
+
+        // v0 survived the GC: the live snapshot still resolves k to it.
+        assert_eq!(db.get_as_of("k", snap_seq).unwrap().as_deref(), Some("v0"));
+        // The present sees the newest write.
+        assert_eq!(db.get("k").unwrap(), Some(format!("{big}-v60")));
+
+        // Release the snapshot, then compact again: v0 is now unreachable -> collected.
+        drop(snap);
+        db.compact().unwrap();
+
+        assert_eq!(db.get_as_of("k", snap_seq).unwrap(), None); // v0 is gone
+        assert_eq!(db.index.get("k").unwrap().len(), 1); // pile collapsed to the latest
 
         let _ = fs::remove_dir_all(p);
     }
