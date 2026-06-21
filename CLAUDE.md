@@ -67,10 +67,37 @@ ou MVCC para isolamento de transações.
   dos segmentos vivos; compaction síncrona por tamanho mescla imutáveis, swap **atômico** do
   manifesto (crash-safe), órfãos limpos no `open`. + truncate-on-recovery. `debug_status`
   (introspecção read-only) pro observer em `playground/observer`.
-- ⏭️ PRÓXIMO (degrau 8): concorrência — `RwLock` para leituras concorrentes, depois **MVCC**
-  (sequence numbers + snapshot isolation). Ver [[07-concorrencia-mvcc]] nas notas.
-- 🧭 GARANTIA ATUAL: durabilidade a **crash** (assumindo que o disco honra o fsync).
-  Números: `set` ~2,6 ms (vs SQLite ~2,8 ms), `get` ~0,77 µs (vs SQLite ~2,15 µs).
+- ✅ FEITO (degrau 8a): **leituras concorrentes**. `get` usa `read_exact_at` (positioned I/O,
+  sem cursor compartilhado) → leituras thread-safe sem lock. `Db` é `Send + Sync`; compartilha
+  como `Arc<RwLock<Db>>` (N leitores XOR 1 escritor), lock grosso **no chamador** (os métodos
+  seguem `&self`/`&mut self`). Teste `tests/concurrency.rs` (1 writer + 8 readers) é o
+  entregável — quebra se o cursor voltar (regressão real do `seek`+`read`).
+- ✅ FEITO (degrau 8b): **MVCC** — `seq` por registro (bump de formato), índice por
+  versão, snapshot do leitor filtra por `seq <= snapshot`, GC respeitando o menor snapshot vivo.
+  Spec detalhada e sub-passos em [[09-mvcc-snapshot-isolation]].
+  - ✅ 8b.1 (formato v2 com `seq` no corpo coberto pelo CRC, `next_seq` reconstruído no replay).
+  - ✅ 8b.2 (índice multi-versão `HashMap<String, Vec<Version>>`; `delete` é tombstone versionado).
+  - ✅ 8b.3 (**leitura por snapshot**): registry `Arc<Mutex<BTreeMap<seq,refcount>>>` **fora** do
+    `RwLock` (evita deadlock no `Drop`); token `Snapshot { seq, registry }` com `Drop` que libera
+    o refcount; `snapshot()` congela `next_seq-1`; `get_as_of(key, snap)` = maior versão com
+    `seq <= snap`; `get` virou `get_as_of(key, next_seq-1)`.
+  - ✅ 8b.4 (**GC consciente de snapshot**): `compact` calcula `min_live` (menor `seq` com
+    refcount>0 via `BTreeMap::keys().next()`; vazio → `next_seq-1`) e usa `versions_to_keep`
+    (piso `seq<=min_live` + tudo acima; `rposition`+slice). Reescreve preservando o `seq`
+    original; `VersionKind::Delete(u64)` agora carrega o `seg` (pra reescrever tombstone acima do
+    piso que viva em segmento imutável); descarta o tombstone-piso (recupera chaves deletadas).
+    Sem snapshot vivo → colapsa pra 1 versão (= comportamento antigo). 11 unit + concorrência +
+    crash. **Degrau 8b fechado.**
+- ⏭️ AGENDADO (degrau 8c, **logo após o 8b.4**): **leituras lock-free** — mover a sincronização
+  pra dentro do `Db` (`Db: Clone` sobre `Arc<Inner>`), encurtar a seção crítica do `get` (I/O
+  fora do lock) e/ou índice imutável com swap atômico → "leitor nunca bloqueia escritor". É o
+  refinamento que o 8a/8b deixaram de fora de propósito ("começar grosso, medir, refinar").
+- 🧭 GARANTIA ATUAL: durabilidade a **crash** (assumindo que o disco honra o fsync) +
+  **snapshot isolation com GC consciente de snapshots vivos** (leitor vê foto consistente no
+  `seq` em que começou via `snapshot()`/`get_as_of`; compaction não coleta versão que um snapshot
+  vivo ainda alcança). Concorrência ainda por `RwLock` grosso (escritor/compaction bloqueia
+  leituras — "leitor nunca bloqueia escritor" é o 8c). Sem transações multi-chave. Números:
+  `set` ~2,6 ms (vs SQLite ~2,8 ms), `get` ~0,77 µs (vs SQLite ~2,15 µs).
 
 ## Roadmap em degraus (cada um resolve a limitação do anterior)
 1. **[FEITO]** `struct Db` + `open` (abre/cria o log, índice em memória)
@@ -81,7 +108,7 @@ ou MVCC para isolamento de transações.
    replay tolera registro rasgado (torn write)
 6. **[FEITO]** Índice de offsets (guarda chave→posição, não o valor) → estilo Bitcask completo
 7. **[FEITO]** Segmentos + compaction (manifesto crash-safe) → base do LSM-tree
-8. **[PRÓXIMO]** Concorrência: lock (`RwLock`) → depois MVCC (sequence numbers, snapshot isolation)
+8. Concorrência: **8a [FEITO]** lock (`RwLock`) → **8b [FEITO]** MVCC (snapshot isolation + GC) → **8c [PRÓXIMO]** leituras lock-free (sync dentro do `Db`, I/O fora da seção crítica)
 9. API HTTP / linguagem de query mínima
 
 ## Garantias a documentar no README final

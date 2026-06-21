@@ -1,12 +1,12 @@
 name: CI
 
-# Quando rodar: a cada push e a cada pull request.
+# When to run: on every push and every pull request.
 on:
   push:
   pull_request:
 
-# Cancela execuções antigas do mesmo branch se um push novo chegar
-# (evita fila de builds redundantes e economiza minutos de CI).
+# Cancel in-flight runs on the same branch when a new push arrives
+# (avoids a queue of redundant builds and saves CI minutes).
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -19,35 +19,35 @@ jobs:
     name: build, test, lint, fmt
     runs-on: ubuntu-latest
     steps:
-      # 1. Baixa o seu código para dentro da VM.
+      # 1. Pull the repo into the VM.
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 2. Instala a toolchain Rust estável + os componentes de lint/fmt.
+      # 2. Install the stable Rust toolchain + the lint/fmt components.
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
 
-      # 3. Cache de dependências: sem isso, todo build baixa e recompila
-      #    o mundo. Com isso, builds seguindo o primeiro ficam minutos mais rápidos.
+      # 3. Dependency cache: without it every build downloads and recompiles
+      #    the world. With it, builds after the first are minutes faster.
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      # 4. Formatação: falha se algum arquivo não estiver no padrão do rustfmt.
-      #    --check não altera nada, só reporta. (Local: `cargo fmt` arruma.)
+      # 4. Formatting: fails if any file is not in rustfmt's style.
+      #    --check changes nothing, only reports. (Locally, `cargo fmt` fixes it.)
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      # 5. Lint: clippy pega armadilhas e código não-idiomático.
-      #    -D warnings transforma todo warning em erro -> o job falha.
+      # 5. Lint: clippy catches pitfalls and non-idiomatic code.
+      #    -D warnings turns every warning into an error -> the job fails.
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      # 6. Build de todo o workspace.
+      # 6. Build the whole workspace.
       - name: Build
         run: cargo build --workspace --verbose
 
-      # 7. Testes de todo o workspace.
+      # 7. Test the whole workspace.
       - name: Test
         run: cargo test --workspace --verbose

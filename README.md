@@ -16,6 +16,7 @@ documented below — that is the point of the project as much as the code.
 - **`fsync` on every write** (`F_FULLFSYNC` on macOS) → crash durability, proven by a SIGKILL test.
 - In-memory **offset index** (Bitcask-style): values stay on disk, so the dataset can exceed RAM.
 - Log-structured **segments + crash-safe compaction** (atomic manifest swap).
+- **MVCC snapshot isolation**: readers get a consistent point-in-time view; GC never reclaims a version a live snapshot still needs.
 - **Benchmarked vs SQLite** under matched durability; CI runs fmt + clippy + tests on every push.
 
 ## Status & guarantees
@@ -25,7 +26,7 @@ documented below — that is the point of the project as much as the code.
 | **Durability** | An acknowledged write survives a process **and** machine crash (power loss / kernel panic), assuming the disk honors the flush. Every write is `fsync`'d before `set`/`delete` returns. |
 | **Crash recovery** | A write torn in half by a crash is detected via a per-record CRC32 and discarded on replay; all complete records before it are preserved. Proven by an automated SIGKILL test. |
 | **Atomicity** | A single `set`/`delete` is the unit of atomicity (one record). Multi-key transactions are not supported yet. |
-| **Isolation** | Single-writer, single-process. Concurrent access control (locking / MVCC) is on the roadmap, not implemented. |
+| **Isolation** | Reads touch no shared file cursor (positioned `pread`), so the engine is `Send + Sync` and safe to share as `Arc<RwLock<Db>>`: **many concurrent readers xor one exclusive writer**. On top of that, **MVCC snapshot isolation**: a reader takes a `snapshot()` and reads via `get_as_of` to see a consistent point-in-time view — writes committed after the snapshot are invisible to it (repeatable read across operations), and compaction's GC never reclaims a version a live snapshot can still reach. The lock is still coarse, though — a writer (including compaction) blocks readers while it runs, so reads are not yet lock-free. |
 
 ## Architecture
 
@@ -37,13 +38,16 @@ ch. 3, "Hash Indexes"):
 - **In-memory index.** A hash map maps each key to the **on-disk location** of its
   value (`offset + length`) — not the value itself. RAM usage scales with the *number
   of keys*, not the total size of the values, so the dataset can exceed RAM. Reads do
-  one `seek + read`; the OS page cache absorbs the cost of hot keys.
+  one positioned read (`pread` / `read_at`) — no shared file cursor, so concurrent
+  readers don't interfere; the OS page cache absorbs the cost of hot keys.
 - **Segments + compaction.** The log is split into fixed-size segment files; the active
   one rolls over when it fills. A size-triggered **compaction** merges the immutable
-  segments into one, keeping only the latest value per key, which reclaims the space held
-  by overwritten and deleted records.
+  segments into one. It doubles as the garbage collector: it keeps every version a live
+  snapshot can still reach (and only the latest version per key when no snapshot is live),
+  reclaiming the space held by overwritten and deleted records.
 - **Recovery by replay.** On `open`, the live segments are replayed in order to rebuild
-  the index. A `DEL` tombstone removes the key, so deletes survive restarts.
+  the index. A `DEL` writes a versioned tombstone, so deletes survive restarts — and a
+  snapshot taken before the delete still resolves the key to its old value.
 
 ### Manifest (crash-safe compaction)
 
@@ -55,20 +59,40 @@ after leaves the new set live (the old segments are orphans, cleaned up on the n
 The swap is the single atomic step that makes compaction safe — the same idea LevelDB and
 RocksDB use.
 
+### MVCC (snapshot isolation)
+
+Every write is stamped with a monotonic **sequence number** (`seq`) — a logical clock.
+A `snapshot()` freezes the current `seq`; reading through `get_as_of(key, seq)` resolves
+each key to the **greatest version with `seq <= snapshot`**, so a reader sees a consistent
+point in time no matter how many writes land afterward (DDIA ch. 7, "Snapshot Isolation").
+
+The append-only log makes this cheap: old versions are never overwritten, so they are
+already on disk — MVCC only has to *stop discarding* them. The index keeps a list of
+versions per key (a `Set` points at the value's location; a `Delete` is a versioned
+tombstone), and `delete` appends a tombstone instead of erasing history.
+
+Garbage collection happens in compaction and respects the **oldest live snapshot**
+(`min_live`): per key it keeps the floor (greatest version `<= min_live`) plus everything
+above it, and drops the rest — which is unreachable by any live reader. With no snapshot
+live, that collapses to the latest version per key. Live snapshots are tracked by a
+refcounted registry kept *outside* the `RwLock`, so releasing one can never deadlock a
+concurrent writer.
+
 ### On-disk record format
 
 Binary, length-prefixed, all integers little-endian:
 
 ```
-┌──────────┬────────┬───────────┬───────────┬──────────┬──────────┐
-│ checksum │   op   │  key_len  │  val_len  │   key    │   val    │
-│  u32 (4) │ u8 (1) │  u32 (4)  │  u32 (4)  │ key_len  │ val_len  │
-└──────────┴────────┴───────────┴───────────┴──────────┴──────────┘
-             └──── CRC32 covers everything from here on ──────────┘
+┌──────────┬────────┬─────────┬───────────┬───────────┬──────────┬──────────┐
+│ checksum │   op   │   seq   │  key_len  │  val_len  │   key    │   val    │
+│  u32 (4) │ u8 (1) │ u64 (8) │  u32 (4)  │  u32 (4)  │ key_len  │ val_len  │
+└──────────┴────────┴─────────┴───────────┴───────────┴──────────┴──────────┘
+             └──── CRC32 covers everything from here on ─────────────────────┘
 ```
 
 - `checksum` — CRC32 of the record body; detects torn writes and corruption.
 - `op` — `0` = SET, `1` = DEL. A full byte, leaving room for future operations.
+- `seq` — the write's monotonic sequence number; the logical clock MVCC reads against.
 - `key_len` / `val_len` — field sizes in bytes; `val_len` is `0` for a DEL.
 
 Length-prefixing is what makes torn-write detection possible: the reader reads exactly
@@ -125,7 +149,8 @@ specialized key/value store over a general SQL engine.
 
 ### What it does **not** do (yet)
 
-Multi-key transactions, concurrent writers, and a network API. See the roadmap.
+Multi-key transactions, concurrent writers, lock-free reads (readers and writers still
+serialize on a coarse `RwLock`), and a network API. See the roadmap.
 
 ## Roadmap
 
@@ -135,7 +160,9 @@ Multi-key transactions, concurrent writers, and a network API. See the roadmap.
 - [x] Binary length-prefixed format, per-record CRC32, `fsync` → crash durability
 - [x] Offset index (values on disk, not in RAM) — Bitcask-complete
 - [x] Segments + size-triggered, crash-safe compaction (manifest swap)
-- [ ] Concurrency: `RwLock`, then MVCC / snapshot isolation
+- [x] Concurrent reads: positioned `pread` + `RwLock` sharing (many readers xor one writer)
+- [x] MVCC snapshot isolation + snapshot-aware garbage collection
+- [ ] Lock-free reads (sync inside `Db`, value I/O out of the critical section)
 - [ ] Network API (HTTP or a minimal query language)
 
 ## Usage
@@ -153,6 +180,13 @@ use storage_engine::Db;
 let mut db = Db::open("data.db")?;
 db.set("key".to_string(), "value".to_string())?;
 assert_eq!(db.get("key")?.as_deref(), Some("value"));
+
+// MVCC: a snapshot is a consistent point-in-time view; later writes are invisible to it.
+let snap = db.snapshot();
+db.set("key".to_string(), "value2".to_string())?;
+assert_eq!(db.get_as_of("key", snap.seq)?.as_deref(), Some("value")); // frozen at the snapshot
+assert_eq!(db.get("key")?.as_deref(), Some("value2"));                // the present moved on
+
 db.delete("key")?;
 ```
 
